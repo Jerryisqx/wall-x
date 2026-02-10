@@ -161,12 +161,12 @@ def main() -> None:
     data_root_path = "/path/to/lerobot/dataset"
     output_stats_dir = "/path/to/save/action_stats"
     trajectory_keys = {  # your dataset keys
-        "action": {
+        "propri": {
             "follow_right_ee_cartesian_pos": [0, 3],
             "follow_right_ee_rotation": [3, 6],
             "follow_right_gripper": [6, 7],
         },
-        "propri": {
+        "action": {
             "master_right_ee_cartesian_pos": [0, 3],
             "master_right_ee_rotation": [3, 6],
             "master_right_gripper": [6, 7],
