@@ -1,3 +1,4 @@
+import re
 import os
 import torch
 import yaml
@@ -2714,3 +2715,199 @@ class Qwen2_5_VLMoEForAction(
             )
 
         return input_ids, model_kwargs
+
+    @staticmethod
+    def fuse_gate_up(
+        fused, prefix, suffix_gate="gate_proj", suffix_up="up_proj", out="gate_up_proj"
+    ):
+        gate_w = fused.get(prefix + f"{suffix_gate}.weight")
+        up_w = fused.get(prefix + f"{suffix_up}.weight")
+        gate_b = fused.get(prefix + f"{suffix_gate}.bias")
+        up_b = fused.get(prefix + f"{suffix_up}.bias")
+
+        # If gate_up_proj already exists, skip fusion
+        if prefix + f"{out}.weight" in fused:
+            return
+
+        if gate_w is not None and up_w is not None:
+            fused[prefix + f"{out}.weight"] = torch.cat([gate_w, up_w], dim=0)
+            if gate_b is not None and up_b is not None:
+                fused[prefix + f"{out}.bias"] = torch.cat([gate_b, up_b], dim=0)
+
+            # Delete old weights
+            for n in [
+                f"{suffix_gate}.weight",
+                f"{suffix_up}.weight",
+                f"{suffix_gate}.bias",
+                f"{suffix_up}.bias",
+            ]:
+                full = prefix + n
+                if full in fused:
+                    del fused[full]
+
+    @staticmethod
+    def fuse_qkv(fused, prefix, *, experts=False, expert_id=None):
+        """
+        prefix:
+        - non-MoE: model.layers.X.self_attn.
+        - MoE:     model.layers.X.self_attn.
+
+        When experts=True, expert_id must be provided
+        """
+
+        if experts:
+            assert expert_id is not None, "expert_id must be provided for MoE attention"
+
+            eid = expert_id
+
+            q_w = fused.get(prefix + f"q_proj_experts.{eid}.weight")
+            k_w = fused.get(prefix + f"k_proj_experts.{eid}.weight")
+            v_w = fused.get(prefix + f"v_proj_experts.{eid}.weight")
+
+            q_b = fused.get(prefix + f"q_proj_experts.{eid}.bias")
+            k_b = fused.get(prefix + f"k_proj_experts.{eid}.bias")
+            v_b = fused.get(prefix + f"v_proj_experts.{eid}.bias")
+
+            out_w = f"qkv_proj_experts.{eid}.weight"
+            out_b = f"qkv_proj_experts.{eid}.bias"
+
+            remove_list = [
+                f"q_proj_experts.{eid}.weight",
+                f"k_proj_experts.{eid}.weight",
+                f"v_proj_experts.{eid}.weight",
+                f"q_proj_experts.{eid}.bias",
+                f"k_proj_experts.{eid}.bias",
+                f"v_proj_experts.{eid}.bias",
+            ]
+
+        else:
+            q_w = fused.get(prefix + "q_proj.weight")
+            k_w = fused.get(prefix + "k_proj.weight")
+            v_w = fused.get(prefix + "v_proj.weight")
+
+            q_b = fused.get(prefix + "q_proj.bias")
+            k_b = fused.get(prefix + "k_proj.bias")
+            v_b = fused.get(prefix + "v_proj.bias")
+
+            out_w = "qkv_proj.weight"
+            out_b = "qkv_proj.bias"
+
+            remove_list = [
+                "q_proj.weight",
+                "k_proj.weight",
+                "v_proj.weight",
+                "q_proj.bias",
+                "k_proj.bias",
+                "v_proj.bias",
+            ]
+
+        if q_w is None or k_w is None or v_w is None:
+            return
+
+        fused[prefix + out_w] = torch.cat([q_w, k_w, v_w], dim=0)
+
+        if q_b is not None and k_b is not None and v_b is not None:
+            fused[prefix + out_b] = torch.cat([q_b, k_b, v_b], dim=0)
+
+        for n in remove_list:
+            full = prefix + n
+            if full in fused:
+                del fused[full]
+    
+    @staticmethod
+    def is_fused(state_dict):
+        return any(".moe.experts.0.gate_up_proj" in key for key in state_dict.keys())
+
+    @staticmethod
+    def convert_to_fused(state_dict):
+        """
+        将 unfused checkpoint 转成 fused checkpoint
+        """
+        fused = {}
+
+        # =========================
+        # Phase 1: Full Copy
+        # =========================
+        for k, v in state_dict.items():
+            fused[k] = v
+
+        # =========================
+        # Phase 2: fuse gate + up (MoE aware)
+        # =========================
+        for key in list(fused.keys()):
+            # language MoE mlp (ANY expert)
+            m = re.match(
+                r"(model\.layers\.\d+\.moe\.experts\.\d+\.)gate_proj\.weight",
+                key,
+            )
+            if m:
+                prefix = m.group(1)
+                Qwen2_5_VLMoEForAction.fuse_gate_up(fused, prefix)
+                continue
+
+            # language non-MoE mlp
+            if re.match(r"(model\.layers\.\d+\.mlp\.)gate_proj\.weight", key):
+                prefix = key.replace("gate_proj.weight", "")
+                Qwen2_5_VLMoEForAction.fuse_gate_up(fused, prefix)
+                continue
+
+            # visual mlp
+            if re.match(r"(visual\.blocks\.\d+\.mlp\.)gate_proj\.weight", key):
+                prefix = key.replace("gate_proj.weight", "")
+                Qwen2_5_VLMoEForAction.fuse_gate_up(fused, prefix)
+
+        # =========================
+        # Phase 3: fuse attention qkv (MoE aware)
+        # =========================
+        for key in list(fused.keys()):
+            # language MoE attention: ANY expert
+            m = re.match(
+                r"(model\.layers\.\d+\.self_attn\.)q_proj_experts\.(\d+)\.weight",
+                key,
+            )
+            if m:
+                prefix = m.group(1)
+                expert_id = int(m.group(2))
+                Qwen2_5_VLMoEForAction.fuse_qkv(
+                    fused,
+                    prefix,
+                    experts=True,
+                    expert_id=expert_id,
+                )
+                continue
+
+            # language non-MoE attention
+            if re.match(r"(model\.layers\.\d+\.self_attn\.)q_proj\.weight", key):
+                prefix = key.replace("q_proj.weight", "")
+                Qwen2_5_VLMoEForAction.fuse_qkv(
+                    fused,
+                    prefix,
+                    experts=False,
+                )
+                continue
+
+            # visual attention
+            if re.match(r"(visual\.blocks\.\d+\.attn\.)q_proj\.weight", key):
+                prefix = key.replace("q_proj.weight", "")
+                Qwen2_5_VLMoEForAction.fuse_qkv(
+                    fused,
+                    prefix,
+                    experts=False,
+                )
+
+        # =========================
+        # Phase 4: sanity check（optional）
+        # =========================
+        for k in fused.keys():
+            assert not any(
+                x in k
+                for x in [
+                    ".gate_proj.",
+                    ".up_proj.",
+                    ".q_proj.",
+                    ".k_proj.",
+                    ".v_proj.",
+                ]
+            ), f"Unfused key still exists: {k}"
+
+        return fused

@@ -994,6 +994,20 @@ class QwenVlAct_Trainer:
                 ckpt_path = self.config["resume"]["ckpt"] + "/model.safetensors"
                 state_dict = load_file(ckpt_path, device="cpu")
 
+                # Check fuse and convert if needed
+                if hasattr(Qwen2_5_VLMoEForAction, "is_fused") and hasattr(
+                    Qwen2_5_VLMoEForAction, "convert_to_fused"
+                ):
+                    if not Qwen2_5_VLMoEForAction.is_fused(state_dict):
+                        self.print_rank0(
+                            "Converting non-fused weights to fused format..."
+                        )
+                        state_dict = Qwen2_5_VLMoEForAction.convert_to_fused(
+                            state_dict
+                        )
+                    else:
+                        self.print_rank0("The weights is fused, skipping conversion.")
+
                 # Add module prefix if needed for distributed training
                 new_state_dict = {}
                 for key in state_dict:
@@ -1009,6 +1023,18 @@ class QwenVlAct_Trainer:
             state_dict = load_file(
                 self.config["resume"]["ckpt"] + "/model.safetensors", device="cpu"
             )
+
+            # Check fuse and convert if needed
+            if hasattr(Qwen2_5_VLMoEForAction, "is_fused") and hasattr(
+                Qwen2_5_VLMoEForAction, "convert_to_fused"
+            ):
+                if not Qwen2_5_VLMoEForAction.is_fused(state_dict):
+                    self.print_rank0(
+                        "Converting non-fused weights to fused format..."
+                    )
+                    state_dict = Qwen2_5_VLMoEForAction.convert_to_fused(state_dict)
+                else:
+                    self.print_rank0("The weights is fused, skipping conversion.")
 
             filtered_state_dict = {
                 k: v
@@ -1065,6 +1091,21 @@ class QwenVlAct_Trainer:
         full_sd = load_file(
             self.config["resume"]["ckpt"] + "/model.safetensors", device="cpu"
         )
+
+        # Check fuse and convert if needed
+        if hasattr(Qwen2_5_VLMoEForAction, "is_fused") and hasattr(
+            Qwen2_5_VLMoEForAction, "convert_to_fused"
+        ):
+            if not Qwen2_5_VLMoEForAction.is_fused(full_sd):
+                if rank == 0:
+                    print(
+                        "Converting non-fused weights to fused format...",
+                        flush=True,
+                    )
+                full_sd = Qwen2_5_VLMoEForAction.convert_to_fused(full_sd)
+            elif rank == 0:
+                print("The weights is fused, skipping conversion.", flush=True)
+
         meta_sharded_sd = self.model.state_dict()
         sharded_sd = {}
 
