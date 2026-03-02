@@ -83,7 +83,7 @@ class JointQwen2VLAttention(nn.Module):
                 nn.Linear(dim_input, qkv_out_features, bias=bias_qkv)
                 for dim_input in self.dim_inputs
             ]
-        )        
+        )
         self.o_proj_experts = nn.ModuleList(
             [
                 nn.Linear(self.num_heads * self.head_dim, dim_input, bias=False)
@@ -301,7 +301,9 @@ class JointQwen2VLAttention(nn.Module):
                 -1, self.num_heads + 2 * self.num_key_value_heads, self.head_dim
             )
             q_out = qkv_out[:, : self.num_heads, :]
-            k_out = qkv_out[:, self.num_heads : self.num_heads + self.num_key_value_heads, :]
+            k_out = qkv_out[
+                :, self.num_heads : self.num_heads + self.num_key_value_heads, :
+            ]
             v_out = qkv_out[:, self.num_heads + self.num_key_value_heads :, :]
 
             if self.config.model_type == "qwen3_vl_text":

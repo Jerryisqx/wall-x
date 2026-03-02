@@ -53,7 +53,9 @@ _CONFIG_FOR_DOC = "Qwen2_5_VLConfig"
 
 
 class Qwen2_5_VLMLP(nn.Module):
-    def __init__(self, config, bias: bool = False, use_selective_recompute: bool = False):
+    def __init__(
+        self, config, bias: bool = False, use_selective_recompute: bool = False
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -74,7 +76,9 @@ class Qwen2_5_VLMLP(nn.Module):
             [self.intermediate_size, self.intermediate_size], dim=-1
         )
         if self.use_selective_recompute:
-            out = cp.checkpoint(self._activation_chunk, gate_out, up_out, use_reentrant=False)
+            out = cp.checkpoint(
+                self._activation_chunk, gate_out, up_out, use_reentrant=False
+            )
         else:
             out = self._activation_chunk(gate_out, up_out)
 
@@ -422,11 +426,12 @@ QWEN2_5_VL_VISION_ATTENTION_CLASSES = {
 
 
 class Qwen2_5_VLVisionBlock(nn.Module):
-    def __init__(self, 
-        config, 
+    def __init__(
+        self,
+        config,
         attn_implementation: str = "sdpa",
-        use_selective_recompute: bool = False
-        ) -> None:
+        use_selective_recompute: bool = False,
+    ) -> None:
         super().__init__()
         self.use_selective_recompute = use_selective_recompute
         self.norm1 = Qwen2RMSNorm(config.hidden_size, eps=1e-6)
@@ -437,7 +442,7 @@ class Qwen2_5_VLVisionBlock(nn.Module):
         self.mlp = Qwen2_5_VLMLP(
             config, bias=True, use_selective_recompute=use_selective_recompute
         )
-    
+
     def _norm1_chunk(self, hidden_states):
         return self.norm1(hidden_states)[0]  # return normed_hidden_states only
 
@@ -1070,11 +1075,11 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
         cos, sin = position_embeddings
 
         query_states, key_states = ops.multimodal_rope(
-            query_states.contiguous(), 
-            key_states.contiguous(), 
-            cos[..., : (cos.size(-1) // 2)].contiguous(), 
-            sin[..., : (sin.size(-1) // 2)].contiguous(), 
-            self.rope_scaling["mrope_section"]
+            query_states.contiguous(),
+            key_states.contiguous(),
+            cos[..., : (cos.size(-1) // 2)].contiguous(),
+            sin[..., : (sin.size(-1) // 2)].contiguous(),
+            self.rope_scaling["mrope_section"],
         )
         if past_key_value is not None:
             cache_kwargs = {
@@ -1083,10 +1088,10 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
                 "cache_position": cache_position,
             }  # Specific to RoPE models
             key_states, value_states = past_key_value.update(
-                key_states.transpose(1, 2), 
-                value_states.transpose(1, 2), 
-                self.layer_idx, 
-                cache_kwargs
+                key_states.transpose(1, 2),
+                value_states.transpose(1, 2),
+                self.layer_idx,
+                cache_kwargs,
             )
             key_states, value_states = key_states.transpose(
                 1, 2
@@ -1220,8 +1225,12 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
             qkv, [self.num_heads * self.head_dim, kv_dim, kv_dim], dim=-1
         )
         query_states = q.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = k.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = v.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        key_states = k.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = v.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_multimodal_rotary_pos_emb(

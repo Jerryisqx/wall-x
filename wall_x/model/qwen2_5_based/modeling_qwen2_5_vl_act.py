@@ -2813,7 +2813,7 @@ class Qwen2_5_VLMoEForAction(
             full = prefix + n
             if full in fused:
                 del fused[full]
-    
+
     @staticmethod
     def is_fused(state_dict):
         return any(".moe.experts.0.gate_up_proj" in key for key in state_dict.keys())

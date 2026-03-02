@@ -1002,9 +1002,7 @@ class QwenVlAct_Trainer:
                         self.print_rank0(
                             "Converting non-fused weights to fused format..."
                         )
-                        state_dict = Qwen2_5_VLMoEForAction.convert_to_fused(
-                            state_dict
-                        )
+                        state_dict = Qwen2_5_VLMoEForAction.convert_to_fused(state_dict)
                     else:
                         self.print_rank0("The weights is fused, skipping conversion.")
 
@@ -1029,9 +1027,7 @@ class QwenVlAct_Trainer:
                 Qwen2_5_VLMoEForAction, "convert_to_fused"
             ):
                 if not Qwen2_5_VLMoEForAction.is_fused(state_dict):
-                    self.print_rank0(
-                        "Converting non-fused weights to fused format..."
-                    )
+                    self.print_rank0("Converting non-fused weights to fused format...")
                     state_dict = Qwen2_5_VLMoEForAction.convert_to_fused(state_dict)
                 else:
                     self.print_rank0("The weights is fused, skipping conversion.")
