@@ -39,10 +39,10 @@ class ModelConfig:
 
     # Path to the pretrained model checkpoint
     model_path: str
-    # Path to the action tokenizer
-    action_tokenizer_path: str
     # Path to train config yaml
     train_config_path: str
+    # Path to the action tokenizer
+    action_tokenizer_path: str | None = None
     # Action dimension for the environment
     action_dim: int = 7
     # State dimension for the environment
@@ -107,7 +107,7 @@ DEFAULT_CONFIGS: dict[EnvMode, ModelConfig] = {
         pred_horizon=32,
         device="cuda",
         dtype="bfloat16",
-        predict_mode="fast",
+        predict_mode="slow",
         camera_key=["face_view", "left_wrist_view", "right_wrist_view"],
     ),
 }
@@ -137,7 +137,7 @@ def create_policy(args: Args) -> WallXPolicy:
     if not Path(config.model_path).exists():
         logger.warning(f"Model path does not exist: {config.model_path}")
 
-    if not Path(config.action_tokenizer_path).exists():
+    if config.action_tokenizer_path is not None and not Path(config.action_tokenizer_path).exists():
         logger.warning(
             f"Action tokenizer path does not exist: {config.action_tokenizer_path}"
         )

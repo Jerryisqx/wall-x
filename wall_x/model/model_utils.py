@@ -1,5 +1,6 @@
 import torch
 import os
+import json
 import numpy as np
 from transformers import AutoProcessor
 from wall_x.model.action_head import Normalizer
@@ -50,7 +51,7 @@ def load_wallx_processors(config):
 
     num_added_tokens = processor.tokenizer.add_tokens(new_tokens)
 
-    if action_tokenizer_type and train_action_tokenizer.vocab_size > 0:
+    if action_tokenizer_type and train_action_tokenizer is not None and train_action_tokenizer.vocab_size > 0:
         action_mapper = {}
         for i in range(train_action_tokenizer.vocab_size):
             token = f"<|action_token_{i}|>"
@@ -74,39 +75,74 @@ def register_normalizers(config, model_path):
     # else:
     #     action_statistic_dof = default_action_statistic_dof
 
-    action_statistic_dof = None
+    # action_statistic_dof = None
 
-    if os.path.exists(model_path + "/normalizer_action.pth"):
-        print(
-            "Loading normalizer_action from checkpoint",
-            model_path + "/normalizer_action.pth",
-            flush=True,
+    # if os.path.exists(model_path + "/normalizer_action.pth"):
+    #     print(
+    #         "Loading normalizer_action from checkpoint",
+    #         model_path + "/normalizer_action.pth",
+    #         flush=True,
+    #     )
+    #     normalizer_action = Normalizer.from_ckpt(model_path + "/normalizer_action.pth")
+    # else:
+    #     normalizer_action = Normalizer(
+    #         action_statistic_dof,
+    #         config["dof_config"],
+    #         min_key=config.get("min_key", "min"),
+    #         delta_key=config.get("delta_key", "delta"),
+    #     )
+    action_statistic_dof = None
+    stat_path = config.get("customized_action_statistic_dof", None)
+    # stat_path = "/x2robot_v2/share/bus2602/pretrain_vq_delta_6d_eef_xloss_448_0214/dataset_type2action_stats_fused_open_priority.json"
+    if stat_path and os.path.exists(stat_path):
+        with open(stat_path, "r") as f:
+            action_statistic_dof = json.load(f)
+
+    min_key = config.get("min_key", "min")
+    delta_key = config.get("delta_key", "delta")
+
+    if action_statistic_dof is not None:
+        print("Loading normalizer_action from json", stat_path, flush=True)
+        normalizer_action = Normalizer(
+            action_statistic_dof, config["dof_config"],
+            min_key=min_key, delta_key=delta_key,
         )
+    elif action_statistic_dof is None and os.path.exists(model_path + "/normalizer_action.pth"):
+        print("Loading normalizer_action from checkpoint", model_path + "/normalizer_propri.pth", flush=True)
         normalizer_action = Normalizer.from_ckpt(model_path + "/normalizer_action.pth")
     else:
-        normalizer_action = Normalizer(
-            action_statistic_dof,
-            config["dof_config"],
-            min_key=config.get("min_key", "min"),
-            delta_key=config.get("delta_key", "delta"),
-        )
+        raise ValueError("No normalizer_action.pth and no action_statistic_dof")
+
 
     # print("action_statistic_dof",action_statistic_dof)
 
-    if os.path.exists(model_path + "/normalizer_propri.pth"):
-        print(
-            "Loading normalizer_propri from checkpoint",
-            model_path + "/normalizer_propri.pth",
-            flush=True,
+    # if os.path.exists(model_path + "/normalizer_propri.pth"):
+    #     print(
+    #         "Loading normalizer_propri from checkpoint",
+    #         model_path + "/normalizer_propri.pth",
+    #         flush=True,
+    #     )
+    #     normalizer_propri = Normalizer.from_ckpt(model_path + "/normalizer_propri.pth")
+    # else:
+    #     normalizer_propri = Normalizer(
+    #         action_statistic_dof,
+    #         config["agent_pos_config"],
+    #         min_key=config.get("min_key", "min"),
+    #         delta_key=config.get("delta_key", "delta"),
+    #     )
+
+    if action_statistic_dof is not None:
+        print("Loading normalizer_propri from json", stat_path, flush=True)
+        normalizer_propri = Normalizer(
+            action_statistic_dof, config["agent_pos_config"],
+            min_key=min_key, delta_key=delta_key,
         )
+    elif action_statistic_dof is None and os.path.exists(model_path + "/normalizer_propri.pth"):
+        print("Loading normalizer_propri from checkpoint", model_path + "/normalizer_propri.pth", flush=True)
         normalizer_propri = Normalizer.from_ckpt(model_path + "/normalizer_propri.pth")
     else:
-        normalizer_propri = Normalizer(
-            action_statistic_dof,
-            config["agent_pos_config"],
-            min_key=config.get("min_key", "min"),
-            delta_key=config.get("delta_key", "delta"),
-        )
+        raise ValueError("No normalizer_propri.pth and no customized_action_statistic_dof")
+
 
     return normalizer_action, normalizer_propri
 

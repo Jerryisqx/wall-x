@@ -60,6 +60,14 @@ KEY_MAPPINGS = {
         "state": "observation.state",
         "action": "action",
     },
+    "libero_all": {
+        "camera": {
+            "observation.images.faceImg": "face_view",
+            "observation.images.rightImg": "right_wrist_view",
+        },
+        "state": "observation.state",
+        "action": "action",
+    }
 }
 
 CAMERA_NAME_MAPPING = {

@@ -25,6 +25,8 @@ def prepare_batch(
     max_pixels: int,
     predict_mode: str = "fast",
     device: str = "cuda",
+    use_state_string_representation: bool = False,
+    state_bins: int = 512,
 ) -> BatchFeature:
     """Prepare observation into model input format.
 
@@ -91,10 +93,38 @@ def prepare_batch(
         processed_images, image_factor, min_pixels, max_pixels
     )
 
+    # Handle robot state/proprioception
+    propri_string = None
+    state = None
+    if "state" in obs:
+        state = obs["state"]
+        if isinstance(state, np.ndarray):
+            state = torch.from_numpy(state).float()
+        elif not isinstance(state, torch.Tensor):
+            state = torch.tensor(state, dtype=torch.float32)
+
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        if state.dim() == 2:
+            state = state.unsqueeze(1)  # [batch, 1, state_dim]
+
+        agent_pos_mask = torch.ones_like(state)
+        if state.shape[-1] > agent_pos_dim:
+            agent_pos_mask[:, :, agent_pos_dim:] = 0
+
+        state = normalizer_propri.normalize_data(state, [obs["dataset_names"]] * state.shape[0])
+
+        if use_state_string_representation:
+            norm_np = state.cpu().numpy()
+            discretized = np.digitize(norm_np, bins=np.linspace(-1, 1, state_bins + 1)[:-1]) - 1
+            discretized = discretized[:, 0, :]
+            mask_np = agent_pos_mask[:, 0, :].cpu().numpy().astype(bool) if isinstance(agent_pos_mask, torch.Tensor) else agent_pos_mask[:, 0, :].astype(bool)
+            propri_string = " ".join(map(str, discretized[0, mask_np[0]]))
+
     # Handle text prompt - format with vision tokens
     instruction = obs["prompt"]
     formatted_text = format_text_with_vision_tokens(
-        instruction, camera_key, predict_mode, pred_horizon
+        instruction, camera_key, predict_mode, pred_horizon, propri_string=propri_string
     )
 
     # Use processor to prepare inputs
@@ -112,40 +142,16 @@ def prepare_batch(
     action_token_id = processor.tokenizer.convert_tokens_to_ids("<|action|>")
     moe_token_types = inputs.input_ids == action_token_id
     inputs["moe_token_types"] = torch.tensor(moe_token_types)
+    # decoded_text = processor.tokenizer.decode(inputs["input_ids"][0], skip_special_tokens=False)
+    # print(f"decoded text: {decoded_text}")
 
-    # obs["dataset_names"]="libero_all"
-
-    # Handle robot state/proprioception if available
-    if "state" in obs:
-        state = obs["state"]
-        if isinstance(state, np.ndarray):
-            state = torch.from_numpy(state).float()
-        elif not isinstance(state, torch.Tensor):
-            state = torch.tensor(state, dtype=torch.float32)
-
-        # Add batch dimension if needed
-        if state.dim() == 1:
-            state = state.unsqueeze(0)
-        if state.dim() == 2:
-            state = state.unsqueeze(1)  # [batch, 1, state_dim]
-
-        # Pad to 20 dimensions if needed (same as training)
-        # if state.shape[-1] < 20:
-        #     padding = torch.zeros(state.shape[0], state.shape[1], 20 - state.shape[-1])
-        #     state = torch.cat([state, padding], dim=-1)
-
-        # Create mask for valid dimensions
-        agent_pos_mask = torch.ones_like(state)
-        if state.shape[-1] > agent_pos_dim:
-            agent_pos_mask[:, :, agent_pos_dim:] = 0
-
-        normalizer_propri.normalize_data(state, [obs["dataset_names"]] * state.shape[0])
-
+    if state is not None and not use_state_string_representation:
         inputs["proprioception"] = state
         inputs["agent_pos_mask"] = agent_pos_mask
 
     # Add dataset name (required by model)
-    inputs["dataset_names"] = [obs["dataset_names"]] * state.shape[0]
+    batch_size = state.shape[0] if state is not None else 1
+    inputs["dataset_names"] = [obs["dataset_names"]] * batch_size
 
     # Move all tensors to device
     for key in inputs:
@@ -208,6 +214,7 @@ def format_text_with_vision_tokens(
     camera_key: List[str],
     predict_mode: str = "diffusion",
     pred_horizon: int = 32,
+    propri_string: str | None = None,
 ) -> str:
     """Format text prompt with vision tokens for the model.
 
@@ -251,14 +258,15 @@ def format_text_with_vision_tokens(
             user_request += f" {view_name}: {vision_start_symbol}{image_pad_symbol}{vision_end_symbol}"
     user_request += "\nInstruction:"
 
+    propri_content = propri_string if propri_string is not None else propri_symbol
     text_prompt = (
-        f"\nPredict the next action in robot action.\nProprioception: {propri_symbol}\n"
+        f"\nPredict the next action in robot action.\nProprioception: {propri_content}\n"
     )
     user_message = f"{user_request} {instruction}{text_prompt}{role_end_symbol}\n"
     assistant_output = (
         f"{role_start_symbol}assistant\n{action_fast_symbol}{role_end_symbol}\n"
     )
-    if predict_mode == "diffusion":
+    if predict_mode in ("diffusion", "slow"):
         assistant_output = f"{role_start_symbol}assistant\n{action_symbol * pred_horizon}{role_end_symbol}\n"
     complete_text = prologue + user_message + assistant_output
 

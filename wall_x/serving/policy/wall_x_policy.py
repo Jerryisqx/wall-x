@@ -18,7 +18,7 @@ class WallXPolicy(BasePolicy):
         self,
         model_path: str,
         train_config: dict,
-        action_tokenizer_path: str,
+        action_tokenizer_path: str | None,
         action_dim: int,
         agent_pos_dim: int,
         pred_horizon: int,
@@ -83,8 +83,15 @@ class WallXPolicy(BasePolicy):
         self.image_factor = image_factor
         self.max_length = max_length
 
+        self.use_state_string_representation = train_config.get("data", {}).get(
+            "use_state_string_representation", train_config.get("use_state_string_representation", False)
+        )
+        self.state_bins = train_config.get("data", {}).get("state_bins", 512)
+
         print("predict_mode", predict_mode)
         print("camera_key", camera_key)
+        print("use_state_string_representation", self.use_state_string_representation)
+        print("state_bins", self.state_bins)
 
         # Load processor
         logger.info("Loading processor and tokenizer...")
@@ -99,6 +106,15 @@ class WallXPolicy(BasePolicy):
         logger.info(
             f"Model loaded successfully. Device: {device}, Action dim: {action_dim}, Horizon: {pred_horizon}"
         )
+        if "x2_normal" in self.normalizer_propri.min:
+            print(f"normalizer_propri x2_normal min: {self.normalizer_propri.min['x2_normal'].data}")
+            print(f"normalizer_propri x2_normal delta: {self.normalizer_propri.delta['x2_normal'].data}")
+            print(f"normalizer_propri x2_normal dim: {self.normalizer_propri.min['x2_normal'].shape}")
+
+        if "x2_normal" in self.normalizer_action.min:
+            print(f"normalizer_action x2_normal min: {self.normalizer_action.min['x2_normal'].data}")
+            print(f"normalizer_action x2_normal delta: {self.normalizer_action.delta['x2_normal'].data}")
+            print(f"normalizer_action x2_normal dim: {self.normalizer_action.min['x2_normal'].shape}")
 
     @property
     def metadata(self) -> Dict[str, Any]:
@@ -148,6 +164,8 @@ class WallXPolicy(BasePolicy):
                 self.max_pixels,
                 self.predict_mode,
                 self.device,
+                self.use_state_string_representation,
+                self.state_bins,
             )
 
             with torch.no_grad():
