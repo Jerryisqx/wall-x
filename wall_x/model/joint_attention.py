@@ -74,25 +74,13 @@ class JointQwen2VLAttention(nn.Module):
         else:
             bias_qkv = False
 
-        self.q_proj_experts = nn.ModuleList(
-            [
-                nn.Linear(dim_input, self.num_heads * self.head_dim, bias=bias_qkv)
-                for dim_input in self.dim_inputs
-            ]
+        qkv_out_features = (
+            self.num_heads * self.head_dim
+            + 2 * self.num_key_value_heads * self.head_dim
         )
-        self.k_proj_experts = nn.ModuleList(
+        self.qkv_proj_experts = nn.ModuleList(
             [
-                nn.Linear(
-                    dim_input, self.num_key_value_heads * self.head_dim, bias=bias_qkv
-                )
-                for dim_input in self.dim_inputs
-            ]
-        )
-        self.v_proj_experts = nn.ModuleList(
-            [
-                nn.Linear(
-                    dim_input, self.num_key_value_heads * self.head_dim, bias=bias_qkv
-                )
+                nn.Linear(dim_input, qkv_out_features, bias=bias_qkv)
                 for dim_input in self.dim_inputs
             ]
         )
@@ -300,8 +288,8 @@ class JointQwen2VLAttention(nn.Module):
         )
 
         # for expert_idx in range(len(self.dim_inputs)):
-        for expert_idx, (q_proj, k_proj, v_proj, mask) in enumerate(
-            zip(self.q_proj_experts, self.k_proj_experts, self.v_proj_experts, masks)
+        for expert_idx, (qkv_proj, mask) in enumerate(
+            zip(self.qkv_proj_experts, masks)
         ):
             if not mask.any():
                 continue
@@ -309,15 +297,14 @@ class JointQwen2VLAttention(nn.Module):
 
             selected_hidden = hidden_states[mask].clone()
 
-            q_out = q_proj(selected_hidden[:, :dim_input]).view(
-                -1, self.num_heads, self.head_dim
+            qkv_out = qkv_proj(selected_hidden[:, :dim_input]).view(
+                -1, self.num_heads + 2 * self.num_key_value_heads, self.head_dim
             )
-            k_out = k_proj(selected_hidden[:, :dim_input]).view(
-                -1, self.num_key_value_heads, self.head_dim
-            )
-            v_out = v_proj(selected_hidden[:, :dim_input]).view(
-                -1, self.num_key_value_heads, self.head_dim
-            )
+            q_out = qkv_out[:, : self.num_heads, :]
+            k_out = qkv_out[
+                :, self.num_heads : self.num_heads + self.num_key_value_heads, :
+            ]
+            v_out = qkv_out[:, self.num_heads + self.num_key_value_heads :, :]
 
             if self.config.model_type == "qwen3_vl_text":
                 q_out = self.q_norms[expert_idx](q_out)[0]
@@ -377,9 +364,7 @@ class JointQwen2VLAttention(nn.Module):
         )
 
         # === Each expert processes its own token slice ===
-        for expert_idx, (q_proj, k_proj, v_proj) in enumerate(
-            zip(self.q_proj_experts, self.k_proj_experts, self.v_proj_experts)
-        ):
+        for expert_idx, qkv_proj in enumerate(self.qkv_proj_experts):
             start, end = start_indices[expert_idx], end_indices[expert_idx]
             if start == end:
                 continue
@@ -388,9 +373,11 @@ class JointQwen2VLAttention(nn.Module):
             expert_input = hidden_states[start:end, :dim_input]
 
             # Compute Q/K/V
-            q_out = q_proj(expert_input)
-            k_out = k_proj(expert_input)
-            v_out = v_proj(expert_input)
+            qkv_out = qkv_proj(expert_input)
+            kv_dim = self.num_key_value_heads * self.head_dim
+            q_out, k_out, v_out = torch.split(
+                qkv_out, [self.num_heads * self.head_dim, kv_dim, kv_dim], dim=-1
+            )
 
             if getattr(self.config, "model_type", None) == "qwen3_vl_text":
                 q_out = self.q_norms[expert_idx](q_out)

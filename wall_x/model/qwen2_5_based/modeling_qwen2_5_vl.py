@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as cp
 from dataclasses import dataclass
 from torch.nn import CrossEntropyLoss
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -52,19 +53,36 @@ _CONFIG_FOR_DOC = "Qwen2_5_VLConfig"
 
 
 class Qwen2_5_VLMLP(nn.Module):
-    def __init__(self, config, bias: bool = False):
+    def __init__(
+        self, config, bias: bool = False, use_selective_recompute: bool = False
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
+        self.gate_up_proj = nn.Linear(
+            self.hidden_size, 2 * self.intermediate_size, bias=bias
+        )
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=bias)
         self.act_fn = ACT2FN[config.hidden_act]
+        self.use_selective_recompute = use_selective_recompute
+
+    def _activation_chunk(self, gate_out, up_out):
+        act = self.act_fn(gate_out)
+        return act * up_out
 
     def forward(self, hidden_state):
-        return self.down_proj(
-            self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state)
+        gate_up_out = self.gate_up_proj(hidden_state)
+        gate_out, up_out = gate_up_out.split(
+            [self.intermediate_size, self.intermediate_size], dim=-1
         )
+        if self.use_selective_recompute:
+            out = cp.checkpoint(
+                self._activation_chunk, gate_out, up_out, use_reentrant=False
+            )
+        else:
+            out = self._activation_chunk(gate_out, up_out)
+
+        return self.down_proj(out)
 
 
 class Qwen2_5_VisionPatchEmbed(nn.Module):
@@ -408,14 +426,28 @@ QWEN2_5_VL_VISION_ATTENTION_CLASSES = {
 
 
 class Qwen2_5_VLVisionBlock(nn.Module):
-    def __init__(self, config, attn_implementation: str = "sdpa") -> None:
+    def __init__(
+        self,
+        config,
+        attn_implementation: str = "sdpa",
+        use_selective_recompute: bool = False,
+    ) -> None:
         super().__init__()
+        self.use_selective_recompute = use_selective_recompute
         self.norm1 = Qwen2RMSNorm(config.hidden_size, eps=1e-6)
         self.norm2 = Qwen2RMSNorm(config.hidden_size, eps=1e-6)
         self.attn = QWEN2_5_VL_VISION_ATTENTION_CLASSES[attn_implementation](
             config.hidden_size, num_heads=config.num_heads
         )
-        self.mlp = Qwen2_5_VLMLP(config, bias=True)
+        self.mlp = Qwen2_5_VLMLP(
+            config, bias=True, use_selective_recompute=use_selective_recompute
+        )
+
+    def _norm1_chunk(self, hidden_states):
+        return self.norm1(hidden_states)[0]  # return normed_hidden_states only
+
+    def _norm2_chunk(self, hidden_states):
+        return self.norm2(hidden_states)[0]
 
     def forward(
         self,
@@ -425,14 +457,42 @@ class Qwen2_5_VLVisionBlock(nn.Module):
         rotary_pos_emb: Optional[torch.Tensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
+
+        # ============================
+        # 1) Norm1 with checkpoint
+        # ============================
+        if self.use_selective_recompute:
+            normed_hidden_states = cp.checkpoint(
+                self._norm1_chunk,
+                hidden_states,
+                use_reentrant=False,
+            )
+        else:
+            normed_hidden_states, _ = self.norm1(hidden_states)
+
         hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states)[0],
+            normed_hidden_states,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             rotary_pos_emb=rotary_pos_emb,
             position_embeddings=position_embeddings,
         )
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states)[0])
+
+        # ============================
+        # 2) Norm2 with checkpoint
+        # ============================
+        if self.use_selective_recompute:
+            normed_hidden_states = cp.checkpoint(
+                self._norm2_chunk,
+                hidden_states,
+                use_reentrant=False,
+            )
+            _ = None
+        else:
+            normed_hidden_states, _ = self.norm2(hidden_states)
+
+        # hidden_states = hidden_states + self.mlp(self.norm2(hidden_states)[0])
+        hidden_states = hidden_states + self.mlp(normed_hidden_states)
         return hidden_states
 
 
@@ -763,13 +823,18 @@ class Qwen2MLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.gate_up_proj = nn.Linear(
+            self.hidden_size, 2 * self.intermediate_size, bias=False
+        )
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate_up_out = self.gate_up_proj(x)
+        gate_out, up_out = gate_up_out.split(
+            [self.intermediate_size, self.intermediate_size], dim=-1
+        )
+        down_proj = self.down_proj(self.act_fn(gate_out) * up_out)
         return down_proj
 
 
@@ -863,15 +928,11 @@ class Qwen2_5_VLAttention(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.q_proj = nn.Linear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=True
+        qkv_dim = (
+            self.num_heads * self.head_dim
+            + 2 * self.num_key_value_heads * self.head_dim
         )
-        self.k_proj = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
-        )
-        self.v_proj = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
-        )
+        self.qkv_proj = nn.Linear(self.hidden_size, qkv_dim, bias=True)
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim, self.hidden_size, bias=False
         )
@@ -893,13 +954,19 @@ class Qwen2_5_VLAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states)
+        kv_dim = self.num_key_value_heads * self.head_dim
+        q, k, v = torch.split(
+            qkv, [self.num_heads * self.head_dim, kv_dim, kv_dim], dim=-1
+        )
 
-        query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        query_states = q.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = k.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = v.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_multimodal_rotary_pos_emb(
@@ -970,13 +1037,15 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
     config.max_window_layers layers.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
+    # def __init__(self, *args, **kwargs):
+    #     super().__init__(*args, **kwargs)
+    def __init__(self, config: Qwen2_5_VLConfig, layer_idx: Optional[int] = None):
+        super().__init__(config, layer_idx)
         # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
         # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
         # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
         self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
+        self.deterministic = config.attn_deterministic
 
     def forward(
         self,
@@ -993,19 +1062,24 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
     ):
         bsz, q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-
-        query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        qkv = self.qkv_proj(hidden_states)
+        kv_dim = self.num_key_value_heads * self.head_dim
+        q, k, v = torch.split(
+            qkv, [self.num_heads * self.head_dim, kv_dim, kv_dim], dim=-1
+        )
+        query_states = q.view(bsz, q_len, self.num_heads, self.head_dim)
+        key_states = k.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = v.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
 
         # Because the input can be padded, the absolute sequence length depends on the max position id.
         cos, sin = position_embeddings
 
         query_states, key_states = ops.multimodal_rope(
-            query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
+            query_states.contiguous(),
+            key_states.contiguous(),
+            cos[..., : (cos.size(-1) // 2)].contiguous(),
+            sin[..., : (sin.size(-1) // 2)].contiguous(),
+            self.rope_scaling["mrope_section"],
         )
         if past_key_value is not None:
             cache_kwargs = {
@@ -1014,8 +1088,14 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
                 "cache_position": cache_position,
             }  # Specific to RoPE models
             key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
+                key_states.transpose(1, 2),
+                value_states.transpose(1, 2),
+                self.layer_idx,
+                cache_kwargs,
             )
+            key_states, value_states = key_states.transpose(
+                1, 2
+            ), value_states.transpose(1, 2)
 
         # repeat k/v heads if n_kv_heads < n_heads
         # key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -1033,7 +1113,7 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
             elif hasattr(self.config, "_pre_quantization_dtype"):
                 target_dtype = self.config._pre_quantization_dtype
             else:
-                target_dtype = self.q_proj.weight.dtype
+                target_dtype = self.qkv_proj.weight.dtype
 
             logger.warning_once(
                 f"The input hidden states seems to be silently casted in float32, this might be related to"
@@ -1046,9 +1126,6 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
             value_states = value_states.to(target_dtype)
 
         # Reashape to the expected shape for Flash Attention
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
 
         attn_output = flash_attn_func(
             query_states,
@@ -1057,6 +1134,7 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
             dropout_rate,
             softmax_scale=None,
             causal=self.is_causal,
+            deterministic=self.deterministic,
         )
 
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
@@ -1064,6 +1142,39 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
 
         if not output_attentions:
             attn_weights = None
+        if output_attentions:
+            with torch.no_grad():
+                query_states = query_states.transpose(1, 2)
+                key_states = key_states.transpose(1, 2)
+                key_states = repeat_kv(key_states, self.num_key_value_groups)
+                scale = 1.0 / torch.sqrt(
+                    torch.tensor(
+                        self.head_dim, device=hidden_states.device, dtype=torch.float32
+                    )
+                )
+                attention_score = (
+                    torch.matmul(query_states, key_states.transpose(-2, -1)) * scale
+                )
+                causal_mask_local = torch.tril(
+                    torch.ones(
+                        attention_score.size(-2),
+                        attention_score.size(-1),
+                        device=attention_score.device,
+                        dtype=torch.bool,
+                    )
+                )
+                mask = (
+                    causal_mask_local.unsqueeze(0)
+                    .unsqueeze(0)
+                    .expand(attention_score.size(0), attention_score.size(1), -1, -1)
+                )
+                if mask.dtype != attention_score.dtype:
+                    mask = mask.to(dtype=attention_score.dtype)
+                attention_score = attention_score.masked_fill(
+                    ~(mask.bool()), float("-inf")
+                )
+                attention_score = torch.softmax(attention_score, dim=-1)
+                attn_weights = attention_score[0].mean(0)
 
         return attn_output, attn_weights, past_key_value
 
@@ -1108,13 +1219,18 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
 
         bsz, q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-
-        query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        qkv = self.qkv_proj(hidden_states)
+        kv_dim = self.num_key_value_heads * self.head_dim
+        q, k, v = torch.split(
+            qkv, [self.num_heads * self.head_dim, kv_dim, kv_dim], dim=-1
+        )
+        query_states = q.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = k.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = v.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_multimodal_rotary_pos_emb(

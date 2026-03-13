@@ -6,6 +6,9 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cassert>
+#include <cmath>
+#include <cfloat>
 #include <type_traits>
 
 #include <ATen/cuda/CUDAContext.h>
@@ -13,441 +16,599 @@
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 
-// Type traits for CUDA types
-template <typename T>
-struct CudaTypeTraits
-{
-    static constexpr bool is_supported = false;
-};
+#define CUDA_CHECK(cmd) do { \
+    cudaError_t result = cmd; \
+    if (result != cudaSuccess) { \
+        printf("[ERROR] CUDA error %s:%d '%s': (%d) %s\n", __FILE__, __LINE__, #cmd, (int)result, cudaGetErrorString(result)); \
+    } \
+} while(0)
 
-template <>
-struct CudaTypeTraits<float>
-{
-    static constexpr bool is_supported = true;
-    using type = float;
-    static constexpr const char *name = "float";
-};
-
-template <>
-struct CudaTypeTraits<half>
-{
-    static constexpr bool is_supported = true;
-    using type = half;
-    static constexpr const char *name = "half";
-};
-
-template <>
-struct CudaTypeTraits<__nv_bfloat16>
-{
-    static constexpr bool is_supported = true;
-    using type = __nv_bfloat16;
-    static constexpr const char *name = "bfloat16";
-};
-
-// Optimized forward kernel template
-template <typename T>
-__global__ void multimodal_rope_forward_kernel(
-    const T *__restrict__ q,                       // [batch, q_heads, seq_len, head_dim]
-    const T *__restrict__ k,                       // [batch, kv_heads, seq_len, head_dim]
-    const T *__restrict__ cos,                     // [3, batch, seq_len, head_dim]
-    const T *__restrict__ sin,                     // [3, batch, seq_len, head_dim]
-    T *__restrict__ q_out,                         // [batch, q_heads, seq_len, head_dim]
-    T *__restrict__ k_out,                         // [batch, kv_heads, seq_len, head_dim]
-    const int *__restrict__ mrope_section_doubled, // [32, 48, 48]
-    int batch_size,
-    int q_heads,
-    int kv_heads,
-    int seq_len,
-    int head_dim)
-{
-    static_assert(CudaTypeTraits<T>::is_supported, "Unsupported data type");
-
-    // Block organization: batch_size * (q_heads + kv_heads) blocks
-    int batch_idx = blockIdx.x;
-    int head_idx = blockIdx.y;
-    int seq_paral_size = gridDim.z;
-    int seq_paral_idx = blockIdx.z;
-
-    bool is_q_head = head_idx < q_heads;
-    int actual_head_idx = is_q_head ? head_idx : (head_idx - q_heads);
-    int total_heads = is_q_head ? q_heads : kv_heads;
-
-    // Each warp processes one token (seq position)
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
-    int warps_per_block = blockDim.x / 32;
-
-    // Process tokens in batches across warps
-
-    for (int seq_base = warp_id + seq_paral_idx * warps_per_block; seq_base < seq_len; seq_base += seq_paral_size * warps_per_block)
-    {
-        int seq_idx = seq_base;
-        if (seq_idx >= seq_len)
-            break;
-
-        // Each lane processes multiple dimensions (head_dim=128, 32 lanes)
-        constexpr int dims_per_lane = 4;
-        for (int dim_batch = 0; dim_batch < (head_dim + 31) / 32; ++dim_batch)
-        {
-            int dim_start = dim_batch * 32 + lane_id;
-            if (dim_start >= head_dim)
-                break;
-
-#pragma unroll
-            for (int dim_offset = 0; dim_offset < dims_per_lane; ++dim_offset)
-            {
-                int dim_idx = dim_start + dim_offset * 32;
-                if (dim_idx >= head_dim)
-                    break;
-
-                // Determine which section this dimension belongs to
-                int section_idx;
-                int cos_sin_d = dim_idx;
-                if (dim_idx < mrope_section_doubled[0])
-                {
-                    section_idx = 0;
-                }
-                else if (dim_idx < mrope_section_doubled[0] + mrope_section_doubled[1])
-                {
-                    section_idx = 1;
-                }
-                else
-                {
-                    section_idx = 2;
-                }
-
-                // Load cos/sin values (coalesced access)
-                int cos_sin_idx = section_idx * batch_size * seq_len * head_dim +
-                                  batch_idx * seq_len * head_dim +
-                                  seq_idx * head_dim + cos_sin_d;
-
-                T cos_val = cos[cos_sin_idx];
-                T sin_val = sin[cos_sin_idx];
-
-                // Calculate tensor indices
-                int tensor_idx = batch_idx * total_heads * seq_len * head_dim +
-                                 actual_head_idx * seq_len * head_dim +
-                                 seq_idx * head_dim + dim_idx;
-
-                // Get input value
-                T input_val = is_q_head ? q[tensor_idx] : k[tensor_idx];
-
-                // Calculate rotate_half value
-                int half_dim = head_dim / 2;
-                int rotate_dim = (dim_idx < half_dim) ? (dim_idx + half_dim) : (dim_idx - half_dim);
-                int rotate_tensor_idx = batch_idx * total_heads * seq_len * head_dim +
-                                        actual_head_idx * seq_len * head_dim +
-                                        seq_idx * head_dim + rotate_dim;
-
-                T rotate_val = is_q_head ? q[rotate_tensor_idx] : k[rotate_tensor_idx];
-                if (dim_idx < half_dim)
-                {
-                    if constexpr (std::is_same_v<T, half>)
-                    {
-                        rotate_val = __hneg(rotate_val);
-                    }
-                    else if constexpr (std::is_same_v<T, __nv_bfloat16>)
-                    {
-#if __CUDA_ARCH__ >= 800                                 // BFloat16 support requires Ampere or newer
-                        rotate_val = __hneg(rotate_val); // __hneg works for bfloat16 in newer CUDA
+// =============================================================================
+// Helper: convert vector of T to float4 (from xcompute m_rope)
+// =============================================================================
+template<typename T>
+__device__ __forceinline__ float4 to_float4(const T* ptr) {
+    if constexpr (std::is_same_v<T, half>) {
+        half2 h2_0 = reinterpret_cast<const half2*>(ptr)[0];
+        half2 h2_1 = reinterpret_cast<const half2*>(ptr)[1];
+        float2 f2_0 = __half22float2(h2_0);
+        float2 f2_1 = __half22float2(h2_1);
+        return make_float4(f2_0.x, f2_0.y, f2_1.x, f2_1.y);
+    } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        __nv_bfloat162 b2_0 = reinterpret_cast<const __nv_bfloat162*>(ptr)[0];
+        __nv_bfloat162 b2_1 = reinterpret_cast<const __nv_bfloat162*>(ptr)[1];
+#if __CUDA_ARCH__ >= 800
+        float2 f2_0 = __bfloat1622float2(b2_0);
+        float2 f2_1 = __bfloat1622float2(b2_1);
+        return make_float4(f2_0.x, f2_0.y, f2_1.x, f2_1.y);
 #else
-                        rotate_val = __float2bfloat16(-__bfloat162float(rotate_val));
+        printf("Unsupported on arch < 800");
 #endif
-                    }
-                    else
-                    {
-                        rotate_val = -rotate_val;
-                    }
-                }
+    } else if constexpr (std::is_same_v<T, float>) {
+        return reinterpret_cast<const float4*>(ptr)[0];
+    } else {
+        static_assert(sizeof(T) == 0, "Unsupported type");
+    }
+}
 
-                // Apply RoPE: output = input * cos + rotate_half(input) * sin
-                T output_val = input_val * cos_val + rotate_val * sin_val;
+template<typename T>
+__device__ __forceinline__ void from_float4(T* ptr, const float4& f4) {
+    if constexpr (std::is_same_v<T, half>) {
+        half2 h2_0 = __float22half2_rn(make_float2(f4.x, f4.y));
+        half2 h2_1 = __float22half2_rn(make_float2(f4.z, f4.w));
+        reinterpret_cast<half2*>(ptr)[0] = h2_0;
+        reinterpret_cast<half2*>(ptr)[1] = h2_1;
+    } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+#if __CUDA_ARCH__ >= 800
+        __nv_bfloat162 b2_0 = __float22bfloat162_rn(make_float2(f4.x, f4.y));
+        __nv_bfloat162 b2_1 = __float22bfloat162_rn(make_float2(f4.z, f4.w));
+        reinterpret_cast<__nv_bfloat162*>(ptr)[0] = b2_0;
+        reinterpret_cast<__nv_bfloat162*>(ptr)[1] = b2_1;
+#else
+        printf("Unsupported on arch < 800");
+#endif
+    } else if constexpr (std::is_same_v<T, float>) {
+        reinterpret_cast<float4*>(ptr)[0] = f4;
+    } else {
+        static_assert(sizeof(T) == 0, "Unsupported type");
+    }
+}
 
-                // Store result
-                if (is_q_head)
-                {
-                    q_out[tensor_idx] = output_val;
-                }
-                else
-                {
-                    k_out[tensor_idx] = output_val;
-                }
-            }
+// =============================================================================
+// MRopeKernel - Forward (from xcompute, adapted for PyTorch)
+// q, k layout: [batch, seq_len, heads, head_dim]
+// cos, sin layout: [3, batch, seq_len, head_dim/2]
+// =============================================================================
+template<class T>
+__global__ void MRopeKernel(const T* cos, const T* sin,
+                            const T* q, const int q_h, const T* k, const int k_h,
+                            T* q_embed, T* k_embed, const int first, const int second,
+                            const int d) {
+    extern __shared__ char cos_sin[];
+    const int half_dim = d / 2;
+    T* cos_smem = reinterpret_cast<T*>(cos_sin);
+    T* sin_smem = cos_smem + half_dim;
+    int b = blockIdx.x;
+    int s = blockIdx.y;
+
+    int64_t offset = gridDim.x * gridDim.y * half_dim;
+    int64_t cos_sin_b_stride = gridDim.y * half_dim;
+    int64_t cos_sin_s_stride = half_dim;
+#define SIN_GMEM(a, b, c, d) sin[(a) * offset + (b) * cos_sin_b_stride + (c) * cos_sin_s_stride + (d)]
+#define COS_GMEM(a, b, c, d) cos[(a) * offset + (b) * cos_sin_b_stride + (c) * cos_sin_s_stride + (d)]
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x) {
+        if (i < first) {
+            cos_smem[i] = COS_GMEM(0, b, s, i);
+            sin_smem[i] = SIN_GMEM(0, b, s, i);
+        } else if (i < (second + first)) {
+            cos_smem[i] = COS_GMEM(1, b, s, i);
+            sin_smem[i] = SIN_GMEM(1, b, s, i);
+        } else {
+            cos_smem[i] = COS_GMEM(2, b, s, i);
+            sin_smem[i] = SIN_GMEM(2, b, s, i);
+        }
+    }
+    __syncthreads();
+
+    int64_t q_b_offset = gridDim.y * q_h * d;
+    int64_t q_s_offset = q_h * d;
+    int64_t q_h_offset = d;
+    int64_t k_b_offset = gridDim.y * k_h * d;
+    int64_t k_s_offset = k_h * d;
+    int64_t k_h_offset = d;
+#define Q_GMEM(a, b, c, d) q[(a) * q_b_offset + (b) * q_s_offset + (c) * q_h_offset + d]
+#define K_GMEM(a, b, c, d) k[(a) * k_b_offset + (b) * k_s_offset + (c) * k_h_offset + d]
+#define Q_EMBED_GMEM(a, b, c, d) q_embed[(a) * q_b_offset + (b) * q_s_offset + (c) * q_h_offset + d]
+#define K_EMBED_GMEM(a, b, c, d) k_embed[(a) * k_b_offset + (b) * k_s_offset + (c) * k_h_offset + d]
+
+    for (int j = threadIdx.x * 4; j < q_h * half_dim; j += blockDim.x * 4) {
+        int h_idx = j / half_dim;
+        int base_d = j % half_dim;
+        if (base_d + 3 >= half_dim) continue;
+
+        if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+            __nv_bfloat162 q_x0 = reinterpret_cast<const __nv_bfloat162*>(&Q_GMEM(b, s, h_idx, base_d))[0];
+            __nv_bfloat162 q_x1 = reinterpret_cast<const __nv_bfloat162*>(&Q_GMEM(b, s, h_idx, base_d))[1];
+            __nv_bfloat162 q_x2 = reinterpret_cast<const __nv_bfloat162*>(&Q_GMEM(b, s, h_idx, base_d + half_dim))[0];
+            __nv_bfloat162 q_x3 = reinterpret_cast<const __nv_bfloat162*>(&Q_GMEM(b, s, h_idx, base_d + half_dim))[1];
+
+            __nv_bfloat162 cos_vec_0 = reinterpret_cast<__nv_bfloat162*>(&cos_smem[base_d])[0];
+            __nv_bfloat162 cos_vec_1 = reinterpret_cast<__nv_bfloat162*>(&cos_smem[base_d])[1];
+            __nv_bfloat162 sin_vec_0 = reinterpret_cast<__nv_bfloat162*>(&sin_smem[base_d])[0];
+            __nv_bfloat162 sin_vec_1 = reinterpret_cast<__nv_bfloat162*>(&sin_smem[base_d])[1];
+#if __CUDA_ARCH__ >= 800
+            __nv_bfloat162 q0_rot = __nv_bfloat162(
+                                    q_x0.x * cos_vec_0.x - q_x2.x * sin_vec_0.x,
+                                    q_x0.y * cos_vec_0.y - q_x2.y * sin_vec_0.y
+                                );
+            __nv_bfloat162 q1_rot = __nv_bfloat162(
+                                    q_x1.x * cos_vec_1.x - q_x3.x * sin_vec_1.x,
+                                    q_x1.y * cos_vec_1.y - q_x3.y * sin_vec_1.y
+                                );
+            __nv_bfloat162 q2_rot = __nv_bfloat162(
+                                    q_x2.x * cos_vec_0.x + q_x0.x * sin_vec_0.x,
+                                    q_x2.y * cos_vec_0.y + q_x0.y * sin_vec_0.y
+                                );
+            __nv_bfloat162 q3_rot = __nv_bfloat162(
+                                    q_x3.x * cos_vec_1.x + q_x1.x * sin_vec_1.x,
+                                    q_x3.y * cos_vec_1.y + q_x1.y * sin_vec_1.y
+                                );
+            reinterpret_cast<__nv_bfloat162*>(&Q_EMBED_GMEM(b, s, h_idx, base_d))[0] = q0_rot;
+            reinterpret_cast<__nv_bfloat162*>(&Q_EMBED_GMEM(b, s, h_idx, base_d))[1] = q1_rot;
+            reinterpret_cast<__nv_bfloat162*>(&Q_EMBED_GMEM(b, s, h_idx, base_d + half_dim))[0] = q2_rot;
+            reinterpret_cast<__nv_bfloat162*>(&Q_EMBED_GMEM(b, s, h_idx, base_d + half_dim))[1] = q3_rot;
+#endif
+        } else if constexpr (std::is_same_v<T, __half>) {
+            __half2 q_x0 = reinterpret_cast<const __half2*>(&Q_GMEM(b, s, h_idx, base_d))[0];
+            __half2 q_x1 = reinterpret_cast<const __half2*>(&Q_GMEM(b, s, h_idx, base_d))[1];
+            __half2 q_x2 = reinterpret_cast<const __half2*>(&Q_GMEM(b, s, h_idx, base_d + half_dim))[0];
+            __half2 q_x3 = reinterpret_cast<const __half2*>(&Q_GMEM(b, s, h_idx, base_d + half_dim))[1];
+
+            __half2 cos_vec_0 = reinterpret_cast<__half2*>(&cos_smem[base_d])[0];
+            __half2 cos_vec_1 = reinterpret_cast<__half2*>(&cos_smem[base_d])[1];
+            __half2 sin_vec_0 = reinterpret_cast<__half2*>(&sin_smem[base_d])[0];
+            __half2 sin_vec_1 = reinterpret_cast<__half2*>(&sin_smem[base_d])[1];
+
+            __half2 q0_rot = __halves2half2(
+                q_x0.x * cos_vec_0.x - q_x2.x * sin_vec_0.x,
+                q_x0.y * cos_vec_0.y - q_x2.y * sin_vec_0.y
+            );
+            __half2 q1_rot = __halves2half2(
+                q_x1.x * cos_vec_1.x - q_x3.x * sin_vec_1.x,
+                q_x1.y * cos_vec_1.y - q_x3.y * sin_vec_1.y
+            );
+            __half2 q2_rot = __halves2half2(
+                q_x2.x * cos_vec_0.x + q_x0.x * sin_vec_0.x,
+                q_x2.y * cos_vec_0.y + q_x0.y * sin_vec_0.y
+            );
+            __half2 q3_rot = __halves2half2(
+                q_x3.x * cos_vec_1.x + q_x1.x * sin_vec_1.x,
+                q_x3.y * cos_vec_1.y + q_x1.y * sin_vec_1.y
+            );
+
+            reinterpret_cast<__half2*>(&Q_EMBED_GMEM(b, s, h_idx, base_d))[0] = q0_rot;
+            reinterpret_cast<__half2*>(&Q_EMBED_GMEM(b, s, h_idx, base_d))[1] = q1_rot;
+            reinterpret_cast<__half2*>(&Q_EMBED_GMEM(b, s, h_idx, base_d + half_dim))[0] = q2_rot;
+            reinterpret_cast<__half2*>(&Q_EMBED_GMEM(b, s, h_idx, base_d + half_dim))[1] = q3_rot;
+        } else {
+            float4 q_x0 = to_float4<T>(&Q_GMEM(b, s, h_idx, base_d));
+            float4 q_x1 = to_float4<T>(&Q_GMEM(b, s, h_idx, base_d + half_dim));
+
+            float4 cos_vec = to_float4<T>(&cos_smem[base_d]);
+            float4 sin_vec = to_float4<T>(&sin_smem[base_d]);
+
+            float4 q0_rot = make_float4(
+                q_x0.x * cos_vec.x - q_x1.x * sin_vec.x,
+                q_x0.y * cos_vec.y - q_x1.y * sin_vec.y,
+                q_x0.z * cos_vec.z - q_x1.z * sin_vec.z,
+                q_x0.w * cos_vec.w - q_x1.w * sin_vec.w
+            );
+
+            float4 q1_rot = make_float4(
+                q_x1.x * cos_vec.x + q_x0.x * sin_vec.x,
+                q_x1.y * cos_vec.y + q_x0.y * sin_vec.y,
+                q_x1.z * cos_vec.z + q_x0.z * sin_vec.z,
+                q_x1.w * cos_vec.w + q_x0.w * sin_vec.w
+            );
+
+            from_float4<T>(&Q_EMBED_GMEM(b, s, h_idx, base_d), q0_rot);
+            from_float4<T>(&Q_EMBED_GMEM(b, s, h_idx, base_d + half_dim), q1_rot);
+        }
+    }
+
+    for (int j = threadIdx.x * 4; j < k_h * half_dim; j += blockDim.x * 4) {
+        int h_idx = j / half_dim;
+        int base_d = j % half_dim;
+        if (base_d + 3 >= half_dim) continue;
+
+        if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+            __nv_bfloat162 k_x0 = reinterpret_cast<const __nv_bfloat162*>(&K_GMEM(b, s, h_idx, base_d))[0];
+            __nv_bfloat162 k_x1 = reinterpret_cast<const __nv_bfloat162*>(&K_GMEM(b, s, h_idx, base_d))[1];
+            __nv_bfloat162 k_x2 = reinterpret_cast<const __nv_bfloat162*>(&K_GMEM(b, s, h_idx, base_d + half_dim))[0];
+            __nv_bfloat162 k_x3 = reinterpret_cast<const __nv_bfloat162*>(&K_GMEM(b, s, h_idx, base_d + half_dim))[1];
+
+            __nv_bfloat162 cos_vec_0 = reinterpret_cast<__nv_bfloat162*>(&cos_smem[base_d])[0];
+            __nv_bfloat162 cos_vec_1 = reinterpret_cast<__nv_bfloat162*>(&cos_smem[base_d])[1];
+            __nv_bfloat162 sin_vec_0 = reinterpret_cast<__nv_bfloat162*>(&sin_smem[base_d])[0];
+            __nv_bfloat162 sin_vec_1 = reinterpret_cast<__nv_bfloat162*>(&sin_smem[base_d])[1];
+#if __CUDA_ARCH__ >= 800
+            __nv_bfloat162 k0_rot = __nv_bfloat162(
+                                    k_x0.x * cos_vec_0.x - k_x2.x * sin_vec_0.x,
+                                    k_x0.y * cos_vec_0.y - k_x2.y * sin_vec_0.y
+                                );
+            __nv_bfloat162 k1_rot = __nv_bfloat162(
+                                    k_x1.x * cos_vec_1.x - k_x3.x * sin_vec_1.x,
+                                    k_x1.y * cos_vec_1.y - k_x3.y * sin_vec_1.y
+                                );
+            __nv_bfloat162 k2_rot = __nv_bfloat162(
+                                    k_x2.x * cos_vec_0.x + k_x0.x * sin_vec_0.x,
+                                    k_x2.y * cos_vec_0.y + k_x0.y * sin_vec_0.y
+                                );
+            __nv_bfloat162 k3_rot = __nv_bfloat162(
+                                    k_x3.x * cos_vec_1.x + k_x1.x * sin_vec_1.x,
+                                    k_x3.y * cos_vec_1.y + k_x1.y * sin_vec_1.y
+                                );
+            reinterpret_cast<__nv_bfloat162*>(&K_EMBED_GMEM(b, s, h_idx, base_d))[0] = k0_rot;
+            reinterpret_cast<__nv_bfloat162*>(&K_EMBED_GMEM(b, s, h_idx, base_d))[1] = k1_rot;
+            reinterpret_cast<__nv_bfloat162*>(&K_EMBED_GMEM(b, s, h_idx, base_d + half_dim))[0] = k2_rot;
+            reinterpret_cast<__nv_bfloat162*>(&K_EMBED_GMEM(b, s, h_idx, base_d + half_dim))[1] = k3_rot;
+#endif
+        } else if constexpr (std::is_same_v<T, __half>) {
+            __half2 k_x0 = reinterpret_cast<const __half2*>(&K_GMEM(b, s, h_idx, base_d))[0];
+            __half2 k_x1 = reinterpret_cast<const __half2*>(&K_GMEM(b, s, h_idx, base_d))[1];
+            __half2 k_x2 = reinterpret_cast<const __half2*>(&K_GMEM(b, s, h_idx, base_d + half_dim))[0];
+            __half2 k_x3 = reinterpret_cast<const __half2*>(&K_GMEM(b, s, h_idx, base_d + half_dim))[1];
+
+            __half2 cos_vec_0 = reinterpret_cast<__half2*>(&cos_smem[base_d])[0];
+            __half2 cos_vec_1 = reinterpret_cast<__half2*>(&cos_smem[base_d])[1];
+            __half2 sin_vec_0 = reinterpret_cast<__half2*>(&sin_smem[base_d])[0];
+            __half2 sin_vec_1 = reinterpret_cast<__half2*>(&sin_smem[base_d])[1];
+
+            __half2 k0_rot = __halves2half2(
+                k_x0.x * cos_vec_0.x - k_x2.x * sin_vec_0.x,
+                k_x0.y * cos_vec_0.y - k_x2.y * sin_vec_0.y
+            );
+            __half2 k1_rot = __halves2half2(
+                k_x1.x * cos_vec_1.x - k_x3.x * sin_vec_1.x,
+                k_x1.y * cos_vec_1.y - k_x3.y * sin_vec_1.y
+            );
+            __half2 k2_rot = __halves2half2(
+                k_x2.x * cos_vec_0.x + k_x0.x * sin_vec_0.x,
+                k_x2.y * cos_vec_0.y + k_x0.y * sin_vec_0.y
+            );
+            __half2 k3_rot = __halves2half2(
+                k_x3.x * cos_vec_1.x + k_x1.x * sin_vec_1.x,
+                k_x3.y * cos_vec_1.y + k_x1.y * sin_vec_1.y
+            );
+
+            reinterpret_cast<__half2*>(&K_EMBED_GMEM(b, s, h_idx, base_d))[0] = k0_rot;
+            reinterpret_cast<__half2*>(&K_EMBED_GMEM(b, s, h_idx, base_d))[1] = k1_rot;
+            reinterpret_cast<__half2*>(&K_EMBED_GMEM(b, s, h_idx, base_d + half_dim))[0] = k2_rot;
+            reinterpret_cast<__half2*>(&K_EMBED_GMEM(b, s, h_idx, base_d + half_dim))[1] = k3_rot;
+        } else {
+            float4 k_x0 = to_float4<T>(&K_GMEM(b, s, h_idx, base_d));
+            float4 k_x1 = to_float4<T>(&K_GMEM(b, s, h_idx, base_d + half_dim));
+
+            float4 cos_vec = to_float4<T>(&cos_smem[base_d]);
+            float4 sin_vec = to_float4<T>(&sin_smem[base_d]);
+
+            float4 k0_rot = make_float4(
+                k_x0.x * cos_vec.x - k_x1.x * sin_vec.x,
+                k_x0.y * cos_vec.y - k_x1.y * sin_vec.y,
+                k_x0.z * cos_vec.z - k_x1.z * sin_vec.z,
+                k_x0.w * cos_vec.w - k_x1.w * sin_vec.w
+            );
+
+            float4 k1_rot = make_float4(
+                k_x1.x * cos_vec.x + k_x0.x * sin_vec.x,
+                k_x1.y * cos_vec.y + k_x0.y * sin_vec.y,
+                k_x1.z * cos_vec.z + k_x0.z * sin_vec.z,
+                k_x1.w * cos_vec.w + k_x0.w * sin_vec.w
+            );
+
+            from_float4<T>(&K_EMBED_GMEM(b, s, h_idx, base_d), k0_rot);
+            from_float4<T>(&K_EMBED_GMEM(b, s, h_idx, base_d + half_dim), k1_rot);
         }
     }
 }
 
-// Optimized backward kernel template
-template <typename T>
-__global__ void multimodal_rope_backward_kernel(
-    const T *__restrict__ grad_q_out, // [batch, q_heads, seq_len, head_dim]
-    const T *__restrict__ grad_k_out, // [batch, kv_heads, seq_len, head_dim]
-    const T *__restrict__ q,          // [batch, q_heads, seq_len, head_dim]
-    const T *__restrict__ k,          // [batch, kv_heads, seq_len, head_dim]
-    const T *__restrict__ cos,        // [3, batch, seq_len, head_dim]
-    const T *__restrict__ sin,        // [3, batch, seq_len, head_dim]
-    T *__restrict__ grad_q,           // [batch, q_heads, seq_len, head_dim]
-    T *__restrict__ grad_k,           // [batch, kv_heads, seq_len, head_dim]
-    const int *__restrict__ mrope_section_doubled,
-    int batch_size,
-    int q_heads,
-    int kv_heads,
-    int seq_len,
-    int head_dim)
-{
-    int batch_idx = blockIdx.x;
-    int head_idx = blockIdx.y;
-    int seq_paral_size = gridDim.z;
-    int seq_paral_idx = blockIdx.z;
+// =============================================================================
+// MRopeKernelBackward (from xcompute)
+// =============================================================================
+template<class T>
+__global__ void MRopeKernelBackward(
+    const T* cos,
+    const T* sin,
+    const T* grad_q_embed,
+    const T* grad_k_embed,
+    T* grad_q,
+    T* grad_k,
+    const int first, const int second,
+    const int q_h,
+    const int k_h,
+    const int d) {
 
-    bool is_q_head = head_idx < q_heads;
-    int actual_head_idx = is_q_head ? head_idx : (head_idx - q_heads);
-    int total_heads = is_q_head ? q_heads : kv_heads;
+    extern __shared__ char cos_sin[];
+    const int half_dim = d / 2;
+    T* cos_smem = reinterpret_cast<T*>(cos_sin);
+    T* sin_smem = cos_smem + half_dim;
 
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
-    int warps_per_block = blockDim.x / 32;
+    int b = blockIdx.x;
+    int s = blockIdx.y;
 
-    // Process tokens
-    for (int seq_base = warp_id + seq_paral_idx * warps_per_block; seq_base < seq_len; seq_base += seq_paral_size * warps_per_block)
-    {
-        int seq_idx = seq_base;
-        if (seq_idx >= seq_len)
-            break;
+    int64_t offset = gridDim.x * gridDim.y * half_dim;
+    int64_t cos_sin_b_stride = gridDim.y * half_dim;
+    int64_t cos_sin_s_stride = half_dim;
 
-        // Process dimensions in chunks - much simpler now!
-        constexpr int dims_per_lane = 4;
-        for (int dim_batch = 0; dim_batch < (head_dim + 31) / 32; ++dim_batch)
-        {
-            int dim_start = dim_batch * 32 + lane_id;
-            if (dim_start >= head_dim)
-                break;
+#define SIN_GMEM_BWD(a, b, c, d) sin[(a) * offset + (b) * cos_sin_b_stride + (c) * cos_sin_s_stride + (d)]
+#define COS_GMEM_BWD(a, b, c, d) cos[(a) * offset + (b) * cos_sin_b_stride + (c) * cos_sin_s_stride + (d)]
 
-#pragma unroll
-            for (int dim_offset = 0; dim_offset < dims_per_lane; ++dim_offset)
-            {
-                int dim_idx = dim_start + dim_offset * 32;
-                if (dim_idx >= head_dim)
-                    break;
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x) {
+        if (i < first) {
+            cos_smem[i] = COS_GMEM_BWD(0, b, s, i);
+            sin_smem[i] = SIN_GMEM_BWD(0, b, s, i);
+        } else if (i < (second + first)) {
+            cos_smem[i] = COS_GMEM_BWD(1, b, s, i);
+            sin_smem[i] = SIN_GMEM_BWD(1, b, s, i);
+        } else {
+            cos_smem[i] = COS_GMEM_BWD(2, b, s, i);
+            sin_smem[i] = SIN_GMEM_BWD(2, b, s, i);
+        }
+    }
+    __syncthreads();
 
-                // Get section info for cos/sin reconstruction
-                int section_idx;
-                int cos_sin_d = dim_idx;
-                if (dim_idx < mrope_section_doubled[0])
-                {
-                    section_idx = 0;
-                }
-                else if (dim_idx < mrope_section_doubled[0] + mrope_section_doubled[1])
-                {
-                    section_idx = 1;
-                }
-                else
-                {
-                    section_idx = 2;
-                }
+    int64_t grad_q_b_offset = gridDim.y * q_h * d;
+    int64_t grad_q_s_offset = q_h * d;
+    int64_t grad_q_h_offset = d;
+    int64_t grad_k_b_offset = gridDim.y * k_h * d;
+    int64_t grad_k_s_offset = k_h * d;
+    int64_t grad_k_h_offset = d;
 
-                // Global cos/sin index
-                int cos_sin_idx = section_idx * batch_size * seq_len * head_dim +
-                                  batch_idx * seq_len * head_dim +
-                                  seq_idx * head_dim + cos_sin_d;
+#define GQ_EMBED(a, b, c, d) grad_q_embed[(a) * grad_q_b_offset + (b) * grad_q_s_offset + (c) * grad_q_h_offset + (d)]
+#define GK_EMBED(a, b, c, d) grad_k_embed[(a) * grad_k_b_offset + (b) * grad_k_s_offset + (c) * grad_k_h_offset + (d)]
+#define GQ(a, b, c, d) grad_q[(a) * grad_q_b_offset + (b) * grad_q_s_offset + (c) * grad_q_h_offset + (d)]
+#define GK(a, b, c, d) grad_k[(a) * grad_k_b_offset + (b) * grad_k_s_offset + (c) * grad_k_h_offset + (d)]
 
-                // Tensor index for current position
-                int tensor_idx = batch_idx * total_heads * seq_len * head_dim +
-                                 actual_head_idx * seq_len * head_dim +
-                                 seq_idx * head_dim + dim_idx;
+    for (int j = threadIdx.x * 4; j < q_h * half_dim; j += blockDim.x * 4) {
+        int h_idx = j / half_dim;
+        int base_d = j % half_dim;
+        if (base_d + 3 >= half_dim) continue;
 
-                // Load values
-                T cos_val = cos[cos_sin_idx];
-                T sin_val = sin[cos_sin_idx];
-                T grad_out_val = is_q_head ? grad_q_out[tensor_idx] : grad_k_out[tensor_idx];
+        if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+#if __CUDA_ARCH__ >= 800
+            __nv_bfloat162 gq0_rot_0 = reinterpret_cast<const __nv_bfloat162*>(&GQ_EMBED(b, s, h_idx, base_d))[0];
+            __nv_bfloat162 gq0_rot_1 = reinterpret_cast<const __nv_bfloat162*>(&GQ_EMBED(b, s, h_idx, base_d))[1];
+            __nv_bfloat162 gq1_rot_0 = reinterpret_cast<const __nv_bfloat162*>(&GQ_EMBED(b, s, h_idx, base_d + half_dim))[0];
+            __nv_bfloat162 gq1_rot_1 = reinterpret_cast<const __nv_bfloat162*>(&GQ_EMBED(b, s, h_idx, base_d + half_dim))[1];
 
-                // Calculate paired dimension for rotate_half
-                int half_dim = head_dim / 2;
-                int rotate_dim = (dim_idx < half_dim) ? (dim_idx + half_dim) : (dim_idx - half_dim);
-                int rotate_tensor_idx = batch_idx * total_heads * seq_len * head_dim +
-                                        actual_head_idx * seq_len * head_dim +
-                                        seq_idx * head_dim + rotate_dim;
+            __nv_bfloat162 cos_0 = reinterpret_cast<__nv_bfloat162*>(&cos_smem[base_d])[0];
+            __nv_bfloat162 cos_1 = reinterpret_cast<__nv_bfloat162*>(&cos_smem[base_d])[1];
+            __nv_bfloat162 sin_0 = reinterpret_cast<__nv_bfloat162*>(&sin_smem[base_d])[0];
+            __nv_bfloat162 sin_1 = reinterpret_cast<__nv_bfloat162*>(&sin_smem[base_d])[1];
 
-                // Get gradient from the paired dimension
-                T paired_grad_out = is_q_head ? grad_q_out[rotate_tensor_idx] : grad_k_out[rotate_tensor_idx];
+            __nv_bfloat162 gq0_0 = __nv_bfloat162(
+                gq0_rot_0.x * cos_0.x + gq1_rot_0.x * sin_0.x,
+                gq0_rot_0.y * cos_0.y + gq1_rot_0.y * sin_0.y
+            );
+            __nv_bfloat162 gq0_1 = __nv_bfloat162(
+                gq0_rot_1.x * cos_1.x + gq1_rot_1.x * sin_1.x,
+                gq0_rot_1.y * cos_1.y + gq1_rot_1.y * sin_1.y
+            );
 
-                // Get paired sin value
-                int paired_section_idx;
-                int paired_cos_sin_d = rotate_dim;
-                if (rotate_dim < mrope_section_doubled[0])
-                {
-                    paired_section_idx = 0;
-                }
-                else if (rotate_dim < mrope_section_doubled[0] + mrope_section_doubled[1])
-                {
-                    paired_section_idx = 1;
-                }
-                else
-                {
-                    paired_section_idx = 2;
-                }
+            __nv_bfloat162 gq1_0 = __nv_bfloat162(
+                gq1_rot_0.x * cos_0.x - gq0_rot_0.x * sin_0.x,
+                gq1_rot_0.y * cos_0.y - gq0_rot_0.y * sin_0.y
+            );
+            __nv_bfloat162 gq1_1 = __nv_bfloat162(
+                gq1_rot_1.x * cos_1.x - gq0_rot_1.x * sin_1.x,
+                gq1_rot_1.y * cos_1.y - gq0_rot_1.y * sin_1.y
+            );
 
-                int paired_cos_sin_idx = paired_section_idx * batch_size * seq_len * head_dim +
-                                         batch_idx * seq_len * head_dim +
-                                         seq_idx * head_dim + paired_cos_sin_d;
-                T paired_sin_val = sin[paired_cos_sin_idx];
+            reinterpret_cast<__nv_bfloat162*>(&GQ(b, s, h_idx, base_d))[0] = gq0_0;
+            reinterpret_cast<__nv_bfloat162*>(&GQ(b, s, h_idx, base_d))[1] = gq0_1;
+            reinterpret_cast<__nv_bfloat162*>(&GQ(b, s, h_idx, base_d + half_dim))[0] = gq1_0;
+            reinterpret_cast<__nv_bfloat162*>(&GQ(b, s, h_idx, base_d + half_dim))[1] = gq1_1;
+#endif
+        } else if constexpr (std::is_same_v<T, __half>) {
+            __half2 gq0_rot_0 = reinterpret_cast<const __half2*>(&GQ_EMBED(b, s, h_idx, base_d))[0];
+            __half2 gq0_rot_1 = reinterpret_cast<const __half2*>(&GQ_EMBED(b, s, h_idx, base_d))[1];
+            __half2 gq1_rot_0 = reinterpret_cast<const __half2*>(&GQ_EMBED(b, s, h_idx, base_d + half_dim))[0];
+            __half2 gq1_rot_1 = reinterpret_cast<const __half2*>(&GQ_EMBED(b, s, h_idx, base_d + half_dim))[1];
 
-                // === Compute input gradients (the only thing we need!) ===
+            __half2 cos_0 = reinterpret_cast<__half2*>(&cos_smem[base_d])[0];
+            __half2 cos_1 = reinterpret_cast<__half2*>(&cos_smem[base_d])[1];
+            __half2 sin_0 = reinterpret_cast<__half2*>(&sin_smem[base_d])[0];
+            __half2 sin_1 = reinterpret_cast<__half2*>(&sin_smem[base_d])[1];
 
-                // Direct term: grad_input = grad_out * cos
-                T grad_input_direct = grad_out_val * cos_val;
+            __half2 gq0_0 = __halves2half2(
+                gq0_rot_0.x * cos_0.x + gq1_rot_0.x * sin_0.x,
+                gq0_rot_0.y * cos_0.y + gq1_rot_0.y * sin_0.y
+            );
+            __half2 gq0_1 = __halves2half2(
+                gq0_rot_1.x * cos_1.x + gq1_rot_1.x * sin_1.x,
+                gq0_rot_1.y * cos_1.y + gq1_rot_1.y * sin_1.y
+            );
 
-                // Cross term from rotate_half
-                T grad_input_from_rotate;
-                if (dim_idx < half_dim)
-                {
-                    // First half: gets contribution from second half (positive)
-                    grad_input_from_rotate = paired_grad_out * paired_sin_val;
-                }
-                else
-                {
-                    // Second half: gets contribution from first half (negative due to rotate_half)
-                    grad_input_from_rotate = -paired_grad_out * paired_sin_val;
-                }
+            __half2 gq1_0 = __halves2half2(
+                gq1_rot_0.x * cos_0.x - gq0_rot_0.x * sin_0.x,
+                gq1_rot_0.y * cos_0.y - gq0_rot_0.y * sin_0.y
+            );
+            __half2 gq1_1 = __halves2half2(
+                gq1_rot_1.x * cos_1.x - gq0_rot_1.x * sin_1.x,
+                gq1_rot_1.y * cos_1.y - gq0_rot_1.y * sin_1.y
+            );
 
-                // Total input gradient
-                T total_grad_input = grad_input_direct + grad_input_from_rotate;
+            reinterpret_cast<__half2*>(&GQ(b, s, h_idx, base_d))[0] = gq0_0;
+            reinterpret_cast<__half2*>(&GQ(b, s, h_idx, base_d))[1] = gq0_1;
+            reinterpret_cast<__half2*>(&GQ(b, s, h_idx, base_d + half_dim))[0] = gq1_0;
+            reinterpret_cast<__half2*>(&GQ(b, s, h_idx, base_d + half_dim))[1] = gq1_1;
+        } else {
+            float4 gq0_rot = to_float4<T>(&GQ_EMBED(b, s, h_idx, base_d));
+            float4 gq1_rot = to_float4<T>(&GQ_EMBED(b, s, h_idx, base_d + half_dim));
 
-                // Store input gradients (no atomic operations needed!)
-                if (is_q_head)
-                {
-                    grad_q[tensor_idx] = total_grad_input;
-                }
-                else
-                {
-                    grad_k[tensor_idx] = total_grad_input;
-                }
+            float4 cos_vec = to_float4<T>(&cos_smem[base_d]);
+            float4 sin_vec = to_float4<T>(&sin_smem[base_d]);
 
-                // No cos/sin gradient computation - they're not learnable parameters!
-            }
+            float4 gq0 = make_float4(
+                gq0_rot.x * cos_vec.x + gq1_rot.x * sin_vec.x,
+                gq0_rot.y * cos_vec.y + gq1_rot.y * sin_vec.y,
+                gq0_rot.z * cos_vec.z + gq1_rot.z * sin_vec.z,
+                gq0_rot.w * cos_vec.w + gq1_rot.w * sin_vec.w
+            );
+            float4 gq1 = make_float4(
+                gq1_rot.x * cos_vec.x - gq0_rot.x * sin_vec.x,
+                gq1_rot.y * cos_vec.y - gq0_rot.y * sin_vec.y,
+                gq1_rot.z * cos_vec.z - gq0_rot.z * sin_vec.z,
+                gq1_rot.w * cos_vec.w - gq0_rot.w * sin_vec.w
+            );
+
+            from_float4<T>(&GQ(b, s, h_idx, base_d), gq0);
+            from_float4<T>(&GQ(b, s, h_idx, base_d + half_dim), gq1);
+        }
+    }
+
+    for (int j = threadIdx.x * 4; j < k_h * half_dim; j += blockDim.x * 4) {
+        int h_idx = j / half_dim;
+        int base_d = j % half_dim;
+        if (base_d + 3 >= half_dim) continue;
+
+        if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+#if __CUDA_ARCH__ >= 800
+            __nv_bfloat162 gk0_rot_0 = reinterpret_cast<const __nv_bfloat162*>(&GK_EMBED(b, s, h_idx, base_d))[0];
+            __nv_bfloat162 gk0_rot_1 = reinterpret_cast<const __nv_bfloat162*>(&GK_EMBED(b, s, h_idx, base_d))[1];
+            __nv_bfloat162 gk1_rot_0 = reinterpret_cast<const __nv_bfloat162*>(&GK_EMBED(b, s, h_idx, base_d + half_dim))[0];
+            __nv_bfloat162 gk1_rot_1 = reinterpret_cast<const __nv_bfloat162*>(&GK_EMBED(b, s, h_idx, base_d + half_dim))[1];
+
+            __nv_bfloat162 cos_0 = reinterpret_cast<__nv_bfloat162*>(&cos_smem[base_d])[0];
+            __nv_bfloat162 cos_1 = reinterpret_cast<__nv_bfloat162*>(&cos_smem[base_d])[1];
+            __nv_bfloat162 sin_0 = reinterpret_cast<__nv_bfloat162*>(&sin_smem[base_d])[0];
+            __nv_bfloat162 sin_1 = reinterpret_cast<__nv_bfloat162*>(&sin_smem[base_d])[1];
+
+            __nv_bfloat162 gk0_0 = __nv_bfloat162(
+                gk0_rot_0.x * cos_0.x + gk1_rot_0.x * sin_0.x,
+                gk0_rot_0.y * cos_0.y + gk1_rot_0.y * sin_0.y
+            );
+            __nv_bfloat162 gk0_1 = __nv_bfloat162(
+                gk0_rot_1.x * cos_1.x + gk1_rot_1.x * sin_1.x,
+                gk0_rot_1.y * cos_1.y + gk1_rot_1.y * sin_1.y
+            );
+
+            __nv_bfloat162 gk1_0 = __nv_bfloat162(
+                gk1_rot_0.x * cos_0.x - gk0_rot_0.x * sin_0.x,
+                gk1_rot_0.y * cos_0.y - gk0_rot_0.y * sin_0.y
+            );
+            __nv_bfloat162 gk1_1 = __nv_bfloat162(
+                gk1_rot_1.x * cos_1.x - gk0_rot_1.x * sin_1.x,
+                gk1_rot_1.y * cos_1.y - gk0_rot_1.y * sin_1.y
+            );
+
+            reinterpret_cast<__nv_bfloat162*>(&GK(b, s, h_idx, base_d))[0] = gk0_0;
+            reinterpret_cast<__nv_bfloat162*>(&GK(b, s, h_idx, base_d))[1] = gk0_1;
+            reinterpret_cast<__nv_bfloat162*>(&GK(b, s, h_idx, base_d + half_dim))[0] = gk1_0;
+            reinterpret_cast<__nv_bfloat162*>(&GK(b, s, h_idx, base_d + half_dim))[1] = gk1_1;
+#endif
+        } else if constexpr (std::is_same_v<T, __half>) {
+            __half2 gk0_rot_0 = reinterpret_cast<const __half2*>(&GK_EMBED(b, s, h_idx, base_d))[0];
+            __half2 gk0_rot_1 = reinterpret_cast<const __half2*>(&GK_EMBED(b, s, h_idx, base_d))[1];
+            __half2 gk1_rot_0 = reinterpret_cast<const __half2*>(&GK_EMBED(b, s, h_idx, base_d + half_dim))[0];
+            __half2 gk1_rot_1 = reinterpret_cast<const __half2*>(&GK_EMBED(b, s, h_idx, base_d + half_dim))[1];
+
+            __half2 cos_0 = reinterpret_cast<__half2*>(&cos_smem[base_d])[0];
+            __half2 cos_1 = reinterpret_cast<__half2*>(&cos_smem[base_d])[1];
+            __half2 sin_0 = reinterpret_cast<__half2*>(&sin_smem[base_d])[0];
+            __half2 sin_1 = reinterpret_cast<__half2*>(&sin_smem[base_d])[1];
+
+            __half2 gk0_0 = __halves2half2(
+                __hadd(__hmul(gk0_rot_0.x, cos_0.x), __hmul(gk1_rot_0.x, sin_0.x)),
+                __hadd(__hmul(gk0_rot_0.y, cos_0.y), __hmul(gk1_rot_0.y, sin_0.y))
+            );
+            __half2 gk0_1 = __halves2half2(
+                __hadd(__hmul(gk0_rot_1.x, cos_1.x), __hmul(gk1_rot_1.x, sin_1.x)),
+                __hadd(__hmul(gk0_rot_1.y, cos_1.y), __hmul(gk1_rot_1.y, sin_1.y))
+            );
+
+            __half2 gk1_0 = __halves2half2(
+                __hsub(__hmul(gk1_rot_0.x, cos_0.x), __hmul(gk0_rot_0.x, sin_0.x)),
+                __hsub(__hmul(gk1_rot_0.y, cos_0.y), __hmul(gk0_rot_0.y, sin_0.y))
+            );
+            __half2 gk1_1 = __halves2half2(
+                __hsub(__hmul(gk1_rot_1.x, cos_1.x), __hmul(gk0_rot_1.x, sin_1.x)),
+                __hsub(__hmul(gk1_rot_1.y, cos_1.y), __hmul(gk0_rot_1.y, sin_1.y))
+            );
+
+            reinterpret_cast<__half2*>(&GK(b, s, h_idx, base_d))[0] = gk0_0;
+            reinterpret_cast<__half2*>(&GK(b, s, h_idx, base_d))[1] = gk0_1;
+            reinterpret_cast<__half2*>(&GK(b, s, h_idx, base_d + half_dim))[0] = gk1_0;
+            reinterpret_cast<__half2*>(&GK(b, s, h_idx, base_d + half_dim))[1] = gk1_1;
+        } else {
+            float4 gk0_rot = to_float4<T>(&GK_EMBED(b, s, h_idx, base_d));
+            float4 gk1_rot = to_float4<T>(&GK_EMBED(b, s, h_idx, base_d + half_dim));
+
+            float4 cos_vec = to_float4<T>(&cos_smem[base_d]);
+            float4 sin_vec = to_float4<T>(&sin_smem[base_d]);
+
+            float4 gk0 = make_float4(
+                gk0_rot.x * cos_vec.x + gk1_rot.x * sin_vec.x,
+                gk0_rot.y * cos_vec.y + gk1_rot.y * sin_vec.y,
+                gk0_rot.z * cos_vec.z + gk1_rot.z * sin_vec.z,
+                gk0_rot.w * cos_vec.w + gk1_rot.w * sin_vec.w
+            );
+            float4 gk1 = make_float4(
+                gk1_rot.x * cos_vec.x - gk0_rot.x * sin_vec.x,
+                gk1_rot.y * cos_vec.y - gk0_rot.y * sin_vec.y,
+                gk1_rot.z * cos_vec.z - gk0_rot.z * sin_vec.z,
+                gk1_rot.w * cos_vec.w - gk0_rot.w * sin_vec.w
+            );
+
+            from_float4<T>(&GK(b, s, h_idx, base_d), gk0);
+            from_float4<T>(&GK(b, s, h_idx, base_d + half_dim), gk1);
         }
     }
 }
 
-// Template-based host functions
+// =============================================================================
+// Converts mrope_section_doubled -> first, second
+// Supports [batch, seq_len, heads, dim] layout (from model)
+// =============================================================================
 template <typename T>
-void launch_multimodal_rope_forward_template(
-    const T *q, const T *k, const T *cos, const T *sin,
-    T *q_out, T *k_out,
-    const int *mrope_section_doubled,
-    int batch_size, int q_heads, int kv_heads, int seq_len, int head_dim,
+void launch_mrope_forward_impl(
+    const T* q, const T* k, const T* cos, const T* sin,
+    T* q_out, T* k_out,
+    int first, int second,
+    int batch_size, int seq_len, int q_heads, int kv_heads, int head_dim,
     cudaStream_t stream)
 {
-    static_assert(CudaTypeTraits<T>::is_supported, "Unsupported data type for multimodal RoPE");
+    constexpr int Nthreads = 256;
+    dim3 grid(batch_size, seq_len);
+    size_t smem_size = head_dim * sizeof(T);
 
-    // Grid: batch_size x (q_heads + kv_heads)
-    dim3 grid(batch_size, q_heads + kv_heads, 8);
-
-    // Block: enough threads to handle seq_len with multiple warps
-    int threads_per_block = min(512, ((seq_len + 3) / 4) * 32); // 4 warps max
-    threads_per_block = ((threads_per_block + 31) / 32) * 32;   // Round to warp size
-
-    multimodal_rope_forward_kernel<T><<<grid, threads_per_block, 0, stream>>>(
-        q, k, cos, sin, q_out, k_out, mrope_section_doubled,
-        batch_size, q_heads, kv_heads, seq_len, head_dim);
+    MRopeKernel<T><<<grid, Nthreads, smem_size, stream>>>(
+        const_cast<T*>(cos), const_cast<T*>(sin),
+        q, q_heads, k, kv_heads,
+        q_out, k_out,
+        first, second, head_dim);
 }
 
 template <typename T>
-void launch_multimodal_rope_backward_template(
-    const T *grad_q_out, const T *grad_k_out,
-    const T *q, const T *k, const T *cos, const T *sin,
-    T *grad_q, T *grad_k, const int *mrope_section_doubled,
-    int batch_size, int q_heads, int kv_heads, int seq_len, int head_dim,
+void launch_mrope_backward_impl(
+    const T* grad_q_out, const T* grad_k_out,
+    const T* cos, const T* sin,
+    T* grad_q, T* grad_k,
+    int first, int second,
+    int batch_size, int seq_len, int q_heads, int kv_heads, int head_dim,
     cudaStream_t stream)
 {
-    static_assert(CudaTypeTraits<T>::is_supported, "Unsupported data type for multimodal RoPE");
+    constexpr int Nthreads = 256;
+    dim3 grid(batch_size, seq_len);
+    size_t smem_size = head_dim * sizeof(T);
 
-    dim3 grid(batch_size, q_heads + kv_heads, 8);
-    int threads_per_block = min(512, ((seq_len + 3) / 4) * 32);
-    threads_per_block = ((threads_per_block + 31) / 32) * 32;
-
-    multimodal_rope_backward_kernel<T><<<grid, threads_per_block, 0, stream>>>(
-        grad_q_out, grad_k_out, q, k, cos, sin,
-        grad_q, grad_k, mrope_section_doubled,
-        batch_size, q_heads, kv_heads, seq_len, head_dim);
-}
-
-// Enum for data type dispatch
-enum class DataType
-{
-    FLOAT32,
-    FLOAT16,
-    BFLOAT16
-};
-
-// Template dispatcher
-template <DataType DT>
-struct DataTypeDispatcher;
-
-template <>
-struct DataTypeDispatcher<DataType::FLOAT32>
-{
-    using type = float;
-};
-
-template <>
-struct DataTypeDispatcher<DataType::FLOAT16>
-{
-    using type = half;
-};
-
-template <>
-struct DataTypeDispatcher<DataType::BFLOAT16>
-{
-    using type = __nv_bfloat16;
-};
-
-// Type-safe host interface
-template <DataType DT>
-void launch_multimodal_rope_forward_typed(
-    const void *q, const void *k, const void *cos, const void *sin,
-    void *q_out, void *k_out,
-    const int *mrope_section_doubled,
-    int batch_size, int q_heads, int kv_heads, int seq_len, int head_dim,
-    cudaStream_t stream)
-{
-    using T = typename DataTypeDispatcher<DT>::type;
-
-    launch_multimodal_rope_forward_template<T>(
-        static_cast<const T *>(q),
-        static_cast<const T *>(k),
-        static_cast<const T *>(cos),
-        static_cast<const T *>(sin),
-        static_cast<T *>(q_out),
-        static_cast<T *>(k_out),
-        mrope_section_doubled,
-        batch_size, q_heads, kv_heads, seq_len, head_dim,
-        stream);
-}
-
-template <DataType DT>
-void launch_multimodal_rope_backward_typed(
-    const void *grad_q_out, const void *grad_k_out,
-    const void *q, const void *k, const void *cos, const void *sin,
-    void *grad_q, void *grad_k,
-    const int *mrope_section_doubled,
-    int batch_size, int q_heads, int kv_heads, int seq_len, int head_dim,
-    cudaStream_t stream)
-{
-    using T = typename DataTypeDispatcher<DT>::type;
-
-    launch_multimodal_rope_backward_template<T>(
-        static_cast<const T *>(grad_q_out),
-        static_cast<const T *>(grad_k_out),
-        static_cast<const T *>(q),
-        static_cast<const T *>(k),
-        static_cast<const T *>(cos),
-        static_cast<const T *>(sin),
-        static_cast<T *>(grad_q),
-        static_cast<T *>(grad_k),
-        mrope_section_doubled,
-        batch_size, q_heads, kv_heads, seq_len, head_dim,
-        stream);
+    MRopeKernelBackward<T><<<grid, Nthreads, smem_size, stream>>>(
+        cos, sin,
+        grad_q_out, grad_k_out,
+        grad_q, grad_k,
+        first, second,
+        q_heads, kv_heads, head_dim);
 }
 
 void launch_multimodal_rope_forward(
@@ -457,55 +618,55 @@ void launch_multimodal_rope_forward(
 {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
+    // Scheme A: convert mrope_section_doubled to first, second (half_dim values)
+    int first = mrope_section_doubled[0] / 2;
+    int second = mrope_section_doubled[1] / 2;
+
+    // Support [batch, seq_len, heads, head_dim] (from model) - xcompute layout
     int batch_size = q.size(0);
-    int q_heads = q.size(1);
-    int seq_len = q.size(2);
+    int seq_len = q.size(1);
+    int q_heads = q.size(2);
     int head_dim = q.size(3);
-    int kv_heads = k.size(1);
+    int kv_heads = k.size(2);
 
-    int data_type;
-    if (q.scalar_type() == torch::kFloat32)
-    {
-        data_type = 0;
-    }
-    else if (q.scalar_type() == torch::kFloat16)
-    {
-        data_type = 1;
-    }
-    else if (q.scalar_type() == torch::kBFloat16)
-    {
-        data_type = 2;
+    if (q.scalar_type() == torch::kFloat32) {
+        launch_mrope_forward_impl<float>(
+            static_cast<const float*>(q.data_ptr()),
+            static_cast<const float*>(k.data_ptr()),
+            static_cast<const float*>(cos.data_ptr()),
+            static_cast<const float*>(sin.data_ptr()),
+            static_cast<float*>(q_out.data_ptr()),
+            static_cast<float*>(k_out.data_ptr()),
+            first, second,
+            batch_size, seq_len, q_heads, kv_heads, head_dim,
+            stream);
+    } else if (q.scalar_type() == torch::kFloat16) {
+        launch_mrope_forward_impl<half>(
+            static_cast<const half*>(q.data_ptr()),
+            static_cast<const half*>(k.data_ptr()),
+            static_cast<const half*>(cos.data_ptr()),
+            static_cast<const half*>(sin.data_ptr()),
+            static_cast<half*>(q_out.data_ptr()),
+            static_cast<half*>(k_out.data_ptr()),
+            first, second,
+            batch_size, seq_len, q_heads, kv_heads, head_dim,
+            stream);
+    } else if (q.scalar_type() == torch::kBFloat16) {
+        launch_mrope_forward_impl<__nv_bfloat16>(
+            static_cast<const __nv_bfloat16*>(q.data_ptr()),
+            static_cast<const __nv_bfloat16*>(k.data_ptr()),
+            static_cast<const __nv_bfloat16*>(cos.data_ptr()),
+            static_cast<const __nv_bfloat16*>(sin.data_ptr()),
+            static_cast<__nv_bfloat16*>(q_out.data_ptr()),
+            static_cast<__nv_bfloat16*>(k_out.data_ptr()),
+            first, second,
+            batch_size, seq_len, q_heads, kv_heads, head_dim,
+            stream);
+    } else {
+        throw std::runtime_error("multimodal_rope: unsupported dtype");
     }
 
-    auto mrope_tensor = torch::from_blob(
-        mrope_section_doubled.data(),
-        {3},
-        torch::TensorOptions().dtype(torch::kInt32)
-    ).to(q.device(), /*non_blocking=*/true);
-
-    int *d_mrope_section_doubled = static_cast<int*>(mrope_tensor.data_ptr());
-
-    switch (data_type)
-    {
-    case 0: // float32
-        launch_multimodal_rope_forward_typed<DataType::FLOAT32>(
-            q.data_ptr(), k.data_ptr(), cos.data_ptr(), sin.data_ptr(),
-            q_out.data_ptr(), k_out.data_ptr(), d_mrope_section_doubled,
-            batch_size, q_heads, kv_heads, seq_len, head_dim, stream);
-        break;
-    case 1: // float16
-        launch_multimodal_rope_forward_typed<DataType::FLOAT16>(
-            q.data_ptr(), k.data_ptr(), cos.data_ptr(), sin.data_ptr(),
-            q_out.data_ptr(), k_out.data_ptr(), d_mrope_section_doubled,
-            batch_size, q_heads, kv_heads, seq_len, head_dim, stream);
-        break;
-    case 2: // bfloat16
-        launch_multimodal_rope_forward_typed<DataType::BFLOAT16>(
-            q.data_ptr(), k.data_ptr(), cos.data_ptr(), sin.data_ptr(),
-            q_out.data_ptr(), k_out.data_ptr(), d_mrope_section_doubled,
-            batch_size, q_heads, kv_heads, seq_len, head_dim, stream);
-        break;
-    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void launch_multimodal_rope_backward(
@@ -516,56 +677,51 @@ void launch_multimodal_rope_backward(
 {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    int batch_size = q.size(0);
-    int q_heads = q.size(1);
-    int seq_len = q.size(2);
-    int head_dim = q.size(3);
-    int kv_heads = k.size(1);
+    int first = mrope_section_doubled[0] / 2;
+    int second = mrope_section_doubled[1] / 2;
 
-    int data_type;
-    if (q.scalar_type() == torch::kFloat32)
-    {
-        data_type = 0;
-    }
-    else if (q.scalar_type() == torch::kFloat16)
-    {
-        data_type = 1;
-    }
-    else if (q.scalar_type() == torch::kBFloat16)
-    {
-        data_type = 2;
+    int batch_size = grad_q_out.size(0);
+    int seq_len = grad_q_out.size(1);
+    int q_heads = grad_q.size(2);
+    int head_dim = grad_q_out.size(3);
+    int kv_heads = grad_k.size(2);
+
+    if (grad_q_out.scalar_type() == torch::kFloat32) {
+        launch_mrope_backward_impl<float>(
+            static_cast<const float*>(grad_q_out.data_ptr()),
+            static_cast<const float*>(grad_k_out.data_ptr()),
+            static_cast<const float*>(cos.data_ptr()),
+            static_cast<const float*>(sin.data_ptr()),
+            static_cast<float*>(grad_q.data_ptr()),
+            static_cast<float*>(grad_k.data_ptr()),
+            first, second,
+            batch_size, seq_len, q_heads, kv_heads, head_dim,
+            stream);
+    } else if (grad_q_out.scalar_type() == torch::kFloat16) {
+        launch_mrope_backward_impl<half>(
+            static_cast<const half*>(grad_q_out.data_ptr()),
+            static_cast<const half*>(grad_k_out.data_ptr()),
+            static_cast<const half*>(cos.data_ptr()),
+            static_cast<const half*>(sin.data_ptr()),
+            static_cast<half*>(grad_q.data_ptr()),
+            static_cast<half*>(grad_k.data_ptr()),
+            first, second,
+            batch_size, seq_len, q_heads, kv_heads, head_dim,
+            stream);
+    } else if (grad_q_out.scalar_type() == torch::kBFloat16) {
+        launch_mrope_backward_impl<__nv_bfloat16>(
+            static_cast<const __nv_bfloat16*>(grad_q_out.data_ptr()),
+            static_cast<const __nv_bfloat16*>(grad_k_out.data_ptr()),
+            static_cast<const __nv_bfloat16*>(cos.data_ptr()),
+            static_cast<const __nv_bfloat16*>(sin.data_ptr()),
+            static_cast<__nv_bfloat16*>(grad_q.data_ptr()),
+            static_cast<__nv_bfloat16*>(grad_k.data_ptr()),
+            first, second,
+            batch_size, seq_len, q_heads, kv_heads, head_dim,
+            stream);
+    } else {
+        throw std::runtime_error("multimodal_rope_bwd: unsupported dtype");
     }
 
-    auto mrope_tensor = torch::from_blob(
-        mrope_section_doubled.data(),
-        {3},
-        torch::TensorOptions().dtype(torch::kInt32)
-    ).to(q.device(), /*non_blocking=*/true);
-
-    int *d_mrope_section_doubled = static_cast<int*>(mrope_tensor.data_ptr());
-
-    switch (data_type)
-    {
-    case 0: // float32
-        launch_multimodal_rope_backward_typed<DataType::FLOAT32>(
-            grad_q_out.data_ptr(), grad_k_out.data_ptr(),
-            q.data_ptr(), k.data_ptr(), cos.data_ptr(), sin.data_ptr(),
-            grad_q.data_ptr(), grad_k.data_ptr(), d_mrope_section_doubled,
-            batch_size, q_heads, kv_heads, seq_len, head_dim, stream);
-        break;
-    case 1: // float16
-        launch_multimodal_rope_backward_typed<DataType::FLOAT16>(
-            grad_q_out.data_ptr(), grad_k_out.data_ptr(),
-            q.data_ptr(), k.data_ptr(), cos.data_ptr(), sin.data_ptr(),
-            grad_q.data_ptr(), grad_k.data_ptr(), d_mrope_section_doubled,
-            batch_size, q_heads, kv_heads, seq_len, head_dim, stream);
-        break;
-    case 2: // bfloat16
-        launch_multimodal_rope_backward_typed<DataType::BFLOAT16>(
-            grad_q_out.data_ptr(), grad_k_out.data_ptr(),
-            q.data_ptr(), k.data_ptr(), cos.data_ptr(), sin.data_ptr(),
-            grad_q.data_ptr(), grad_k.data_ptr(), d_mrope_section_doubled,
-            batch_size, q_heads, kv_heads, seq_len, head_dim, stream);
-        break;
-    }
+    CUDA_CHECK(cudaGetLastError());
 }

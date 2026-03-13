@@ -58,15 +58,18 @@ class BlockSparseMLP(nn.Module):
 
         self.use_selective_recompute = use_selective_recompute
 
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.gate_up_proj = nn.Linear(
+            self.hidden_size, 2 * self.intermediate_size, bias=False
+        )
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
         self.act_fn = ACT2FN[self.hidden_act]
 
     def _full_mlp(self, hidden_state):
-        gate_out = self.gate_proj(hidden_state)
-        up_out = self.up_proj(hidden_state)
+        gate_up_out = self.gate_up_proj(hidden_state)
+        gate_out, up_out = gate_up_out.split(
+            [self.intermediate_size, self.intermediate_size], dim=-1
+        )
         act_out = self.act_fn(gate_out) * up_out
         return self.down_proj(act_out)
 
