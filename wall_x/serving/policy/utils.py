@@ -125,7 +125,7 @@ def prepare_batch(
     formatted_text = format_text_with_vision_tokens(
         instruction, camera_key, predict_mode, pred_horizon, propri_string=propri_string
     )
-
+    # print("formatted_text:",formatted_text)
     # Use processor to prepare inputs
     inputs = preprocesser_call(
         processor=processor,
@@ -161,6 +161,9 @@ def prepare_batch(
     dof_mask[:, :, action_dim:] = 0
 
     inputs["dof_mask"] = dof_mask
+
+    inputs["dof_mask"][:,:,20:] = 0
+    # inputs["agent_pos_mask"][:,:,20:] = 0
 
     # Convert to BatchFeature to maintain consistency with training pipeline
     return BatchFeature(data=dict(inputs)).to(device)

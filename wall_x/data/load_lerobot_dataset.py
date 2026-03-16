@@ -15,6 +15,7 @@ from wall_x.data.utils import (
     replace_action_token,
     preprocesser_call,
 )
+from wall_x.data.data_utils import compute_delta_from_state_and_abs_rot
 
 from transformers import AutoProcessor
 from .utils import KEY_MAPPINGS
@@ -47,6 +48,7 @@ class PreprocessedDataset(Dataset[T_co]):
         rank=0,
         world_size=1,
         test_only=False,
+        use_relative_action=False,
     ):
         self.hf_dataset = dataset
 
@@ -73,6 +75,7 @@ class PreprocessedDataset(Dataset[T_co]):
         self.normalizer_propri = normalizer_propri
         # self.norm_stats = norm_stats
         self.lerobot_config = lerobot_config
+        self.use_relative_action = use_relative_action
 
         self.data_config = X2RDataProcessingConfig().update(
             train_test_split=self.dataload_config["train_test_split"],
@@ -135,13 +138,28 @@ class PreprocessedDataset(Dataset[T_co]):
         agent_pos_cfg = self.config["agent_pos_config"]
         dof_cfg = self.config["dof_config"]
 
-        state_present_keys = infer_present_keys(agent_pos.shape[-1], obs_keys, agent_pos_cfg)
-        agent_pos = maybe_expand_rotation_to_6d(agent_pos, state_present_keys, agent_pos_cfg)
-        agent_pos = pad_tensor_with_nan(agent_pos, sum(agent_pos_cfg[k] for k in obs_keys))
+        action = torch.tensor(self.relative(action, agent_pos, dof_cfg))
+        # action = torch.tensor(action)
+        state = torch.tensor(agent_pos)[None,None,:]
 
-        action_present_keys = infer_present_keys(action.shape[-1], pred_keys, dof_cfg)
-        action = maybe_expand_rotation_to_6d(action, action_present_keys, dof_cfg)
-        action = pad_tensor_with_nan(action, sum(dof_cfg[k] for k in pred_keys))
+        # state_present_keys = infer_present_keys(agent_pos.shape[-1], obs_keys, agent_pos_cfg)
+        # agent_pos = maybe_expand_rotation_to_6d(agent_pos, state_present_keys, agent_pos_cfg)
+        # agent_pos = pad_tensor_with_nan(agent_pos, sum(agent_pos_cfg[k] for k in obs_keys))
+
+        # action_present_keys = infer_present_keys(action.shape[-1], pred_keys, dof_cfg)
+        # action = maybe_expand_rotation_to_6d(action, action_present_keys, dof_cfg)
+        # action = pad_tensor_with_nan(action, sum(dof_cfg[k] for k in pred_keys))
+
+        use_state_string_representation = True
+        state_bins = 512
+        agent_pos_mask = torch.ones_like(state)
+        if use_state_string_representation:
+            norm_np = state.cpu().numpy()
+            discretized = np.digitize(norm_np, bins=np.linspace(-1, 1, state_bins + 1)[:-1]) - 1
+            discretized = discretized[:, 0, :]
+            mask_np = agent_pos_mask[:, 0, :].cpu().numpy().astype(bool) if isinstance(agent_pos_mask, torch.Tensor) else agent_pos_mask[:, 0, :].astype(bool)
+            propri_string = " ".join(map(str, discretized[0, mask_np[0]]))
+
 
         frame_index = data["frame_index"]
         instruction_info = {"instruction": data["task"]}
@@ -154,6 +172,7 @@ class PreprocessedDataset(Dataset[T_co]):
             self.data_config.priority_order,
             self._cam_key_mapping,
             generate_subtask_ratio=generate_subtask_ratio,
+            propri_string=propri_string
         )
         text = process_grounding_points(
             complete_text, h, w, resize_h, resize_w, self.data_config.model_type
@@ -162,11 +181,43 @@ class PreprocessedDataset(Dataset[T_co]):
             "image_inputs": image_inputs,
             "text": text,
             "action": action,
-            "agent_pos": agent_pos,
+            # "agent_pos": agent_pos,
             "frame_index": frame_index,
         }
 
         return result
+    
+    def relative(self, action, agent_pos, dof_config):
+        action = np.array(action)
+        agent_pos = np.array(agent_pos)
+
+        # print("action shape:",action.shape)
+        # print("agent_pos shape:",agent_pos.shape)
+        cur=0
+        new_action = []
+        for key,dim in dof_config.items():
+            if key in ["velocity_decomposed","height","head_actions"]:
+                continue
+            if 'relative' not in key:
+                new_action.append(action[:,cur:cur+dim])
+            else:
+                if "rotation" in key:
+                    action_clip = action[:,cur:cur+dim]
+                    agent_pos_clip = agent_pos[cur:cur+dim]
+
+                    tmp = compute_delta_from_state_and_abs_rot(action_clip, agent_pos_clip)
+                    
+                    new_action.append(tmp)
+                else:
+                    action_clip = action[:,cur:cur+dim]
+                    agent_pos_clip = agent_pos[cur:cur+dim]
+                    new_action.append(action_clip - agent_pos_clip[None,:])
+            cur+=dim
+
+        new_action = np.concatenate(new_action,axis=1)
+        # print("new_action shape:",new_action.shape)
+        return new_action
+
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -342,7 +393,7 @@ class DataCollator:
 
     def __call__(self, batch):
         additional_inputs = {}
-
+        fixed_action_size = 26
         for key in batch[0].keys():
             if key == "agent_pos":
                 agent_pos = torch.stack([item["agent_pos"] for item in batch])
@@ -352,29 +403,29 @@ class DataCollator:
                 # print("agent_pos_mask",agent_pos_mask.shape)
                 agent_pos.nan_to_num_(nan=0.0)
 
-                # if agent_pos.shape[-1] != 20:
-                #     agent_pos = torch.cat(
-                #         [
-                #             agent_pos,
-                #             torch.zeros(
-                #                 agent_pos.shape[0],
-                #                 agent_pos.shape[1],
-                #                 20 - agent_pos.shape[-1],
-                #             ),
-                #         ],
-                #         dim=-1,
-                #     )
-                #     agent_pos_mask = torch.cat(
-                #         [
-                #             agent_pos_mask,
-                #             torch.zeros(
-                #                 agent_pos_mask.shape[0],
-                #                 agent_pos_mask.shape[1],
-                #                 20 - agent_pos_mask.shape[-1],
-                #             ),
-                #         ],
-                #         dim=-1,
-                #     )
+                if agent_pos.shape[-1] != fixed_action_size:
+                    agent_pos = torch.cat(
+                        [
+                            agent_pos,
+                            torch.zeros(
+                                agent_pos.shape[0],
+                                agent_pos.shape[1],
+                                fixed_action_size - agent_pos.shape[-1],
+                            ),
+                        ],
+                        dim=-1,
+                    )
+                    agent_pos_mask = torch.cat(
+                        [
+                            agent_pos_mask,
+                            torch.zeros(
+                                agent_pos_mask.shape[0],
+                                agent_pos_mask.shape[1],
+                                fixed_action_size - agent_pos_mask.shape[-1],
+                            ),
+                        ],
+                        dim=-1,
+                    )
                 agent_pos = self.normalizer_propri.normalize_data(
                     agent_pos, self.dataset_name
                 )
@@ -387,27 +438,27 @@ class DataCollator:
                 dof_mask = (~torch.isnan(action)).float()
                 action.nan_to_num_(nan=0.0)
 
-                # if action.shape[-1] != 20:
-                #     action = torch.cat(
-                #         [
-                #             action,
-                #             torch.zeros(
-                #                 action.shape[0], action.shape[1], 20 - action.shape[-1]
-                #             ),
-                #         ],
-                #         dim=-1,
-                #     )
-                #     dof_mask = torch.cat(
-                #         [
-                #             dof_mask,
-                #             torch.zeros(
-                #                 dof_mask.shape[0],
-                #                 dof_mask.shape[1],
-                #                 20 - dof_mask.shape[-1],
-                #             ),
-                #         ],
-                #         dim=-1,
-                #     )
+                if action.shape[-1] != fixed_action_size:
+                    action = torch.cat(
+                        [
+                            action,
+                            torch.zeros(
+                                action.shape[0], action.shape[1], fixed_action_size - action.shape[-1]
+                            ),
+                        ],
+                        dim=-1,
+                    )
+                    dof_mask = torch.cat(
+                        [
+                            dof_mask,
+                            torch.zeros(
+                                dof_mask.shape[0],
+                                dof_mask.shape[1],
+                                fixed_action_size - dof_mask.shape[-1],
+                            ),
+                        ],
+                        dim=-1,
+                    )
                 action = self.normalizer_action.normalize_data(
                     action, self.dataset_name
                 )

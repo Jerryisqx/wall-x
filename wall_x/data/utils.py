@@ -12,7 +12,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
-
+from scipy.spatial.transform import Rotation
 import torch
 from transformers import BatchFeature
 
@@ -35,6 +35,15 @@ KEY_MAPPINGS = {
         "action": "actions",
     },
     "x2_normal": {
+        "camera": {
+            "observation.images.faceImg": "face_view",
+            "observation.images.leftImg": "left_wrist_view",
+            "observation.images.rightImg": "right_wrist_view",
+        },
+        "state": "observation.state",
+        "action": "action",
+    },
+    "ex_normal": {
         "camera": {
             "observation.images.faceImg": "face_view",
             "observation.images.leftImg": "left_wrist_view",
@@ -675,6 +684,7 @@ def get_wallx_normal_text(
     priority_order: Optional[OrderedDict] = None,
     cam_mapping: Optional[Dict[str, str]] = None,
     generate_subtask_ratio: float = 0.0,
+    propri_string: str = None
 ) -> Tuple[str, bool]:
     """Construct complete multimodal prompt text for Wall-X model.
 
@@ -726,35 +736,36 @@ def get_wallx_normal_text(
 
     generate_subtask = False
     priority_keys = ["subtask_generation", "distribute"]
+    propri_content = propri_string if propri_string is not None else propri_symbol
 
     # Decide whether to generate subtask or actions
-    if (
-        bool(set(frame_instruction_info.keys()) & set(priority_keys))
-        and random.random() < generate_subtask_ratio
-    ):
-        # Generate subtask (equivalent to VQA task)
-        instruction = frame_instruction_info.get("instruction", "")
-        text_prompt = "\nPredict the next action in language.\n"
-        user_message = f"{user_request} {instruction}{text_prompt}{role_end_symbol}\n"
+    # if (
+    #     bool(set(frame_instruction_info.keys()) & set(priority_keys))
+    #     and random.random() < generate_subtask_ratio
+    # ):
+    #     # Generate subtask (equivalent to VQA task)
+    #     instruction = frame_instruction_info.get("instruction", "")
+    #     text_prompt = "\nPredict the next action in language.\n"
+    #     user_message = f"{user_request} {instruction}{text_prompt}{role_end_symbol}\n"
 
-        # Find output instruction from priority keys
-        for key in priority_keys:
-            if key in frame_instruction_info:
-                output_instruction = frame_instruction_info[key]
-                break
+    #     # Find output instruction from priority keys
+    #     for key in priority_keys:
+    #         if key in frame_instruction_info:
+    #             output_instruction = frame_instruction_info[key]
+    #             break
 
-        assistant_output = (
-            f"{role_start_symbol}assistant\n{output_instruction}\n{role_end_symbol}"
-        )
-        generate_subtask = True
-    else:
-        # Generate actions
-        instruction = get_task_instruction(
-            frame_instruction_info, priority_order=priority_order
-        )
-        text_prompt = f"\nPredict the next action in robot action.\nProprioception: {propri_symbol}\n"
-        user_message = f"{user_request} {instruction}{text_prompt}{role_end_symbol}\n"
-        assistant_output = f"{role_start_symbol}assistant\n{action_fast_symbol}{role_end_symbol}\n{action_symbol * action_chunk_size}"
+    #     assistant_output = (
+    #         f"{role_start_symbol}assistant\n{output_instruction}\n{role_end_symbol}"
+    #     )
+    #     generate_subtask = True
+    # else:
+    # Generate actions
+    instruction = get_task_instruction(
+        frame_instruction_info, priority_order=priority_order
+    )
+    text_prompt = f"\nPredict the next action in robot action.\nProprioception: {propri_content}\n"
+    user_message = f"{user_request} {instruction}{text_prompt}{role_end_symbol}\n"
+    assistant_output = f"{role_start_symbol}assistant\n{action_fast_symbol}{role_end_symbol}\n{action_symbol * action_chunk_size}"
 
     complete_text = prologue + user_message + assistant_output
     return complete_text, generate_subtask
@@ -980,3 +991,67 @@ def update_action_statistics(
 
     # Update the action_statistic_dof dictionary
     action_statistic_dof.update({robot_key: stats_dict})
+
+
+
+def convert_euler_to_6D(euler_angle):
+    """
+    Convert euler angle to 6D rotation
+    Input:
+        euler_angle: numpy array of shape [low_dim_obs_horizon+horizon, 3] or [3]
+    Output:
+        rotation_6d: numpy array of shape [low_dim_obs_horizon+horizon, 6] or [6]
+    """
+    # TODO: find more elegent way
+    # Convert euler angle to rotation matrix
+    if len(euler_angle.shape) == 1:
+        euler_angle = euler_angle.reshape(1, 3)
+    rotation_matrix = Rotation.from_euler(
+        "xyz", euler_angle
+    ).as_matrix()  # [horizon, 3, 3]
+    # Convert rotation matrix to 6D rotation(first 2 columns of rotation matrix)
+    rotation_6d = np.zeros((euler_angle.shape[0], 6))
+    rotation_6d[:, :3] = rotation_matrix[:, :, 0]
+    rotation_6d[:, 3:] = rotation_matrix[:, :, 1]
+    assert rotation_6d.shape == (
+        euler_angle.shape[0],
+        6,
+    ), f"rotation_6d shape is not correct, you get {rotation_6d.shape}"
+    return rotation_6d.squeeze() if len(euler_angle.shape) == 1 else rotation_6d
+
+
+def convert_6D_to_euler(rotation_6d):
+    """
+    Convert 6D rotation to euler angle
+    Input:
+        rotation_6d: numpy array of shape [low_dim_obs_horizon+horizon, 6] or [6]
+    Output:
+        euler_angle: numpy array of shape [low_dim_obs_horizon+horizon, 3]
+    """
+    if rotation_6d.shape[0] == 6:
+        rotation_6d = rotation_6d.reshape(1, 6)
+    if len(rotation_6d.shape) == 3:
+        rotation_6d = rotation_6d.reshape(-1, 6)
+    # Convert 6D rotation to rotation matrix
+    rotation_matrix = np.zeros((rotation_6d.shape[0], 3, 3))
+    rotation_matrix[:, :, 0] = rotation_6d[:, :3]
+    rotation_matrix[:, :, 1] = rotation_6d[:, 3:6]
+    # get the third column of rotation matrix
+    rotation_matrix[:, :, 2] = np.cross(
+        rotation_matrix[:, :, 0], rotation_matrix[:, :, 1]
+    )
+    assert rotation_matrix.shape == (
+        rotation_6d.shape[0],
+        3,
+        3,
+    ), "rotation_matrix shape is not correct"
+    # Convert rotation matrix to euler angle
+    euler_angle = Rotation.from_matrix(rotation_matrix).as_euler("xyz")
+    assert euler_angle.shape == (
+        rotation_6d.shape[0],
+        3,
+    ), "euler_angle shape is not correct"
+    return euler_angle
+
+
+

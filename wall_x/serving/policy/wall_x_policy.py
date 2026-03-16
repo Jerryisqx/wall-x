@@ -3,14 +3,35 @@ from typing import Dict, Any, List
 import torch
 import copy
 import numpy as np
+import base64
+import copy
+import cv2
 from wall_x.serving.websocket_policy_server import BasePolicy
 from wall_x.model.qwen2_5_based.modeling_qwen2_5_vl_act import Qwen2_5_VLMoEForAction
 from wall_x.serving.policy.utils import prepare_batch
 from wall_x.model.model_utils import load_wallx_processors, register_normalizers
-from wall_x.data.utils import maybe_expand_rotation_to_6d
+from wall_x.data.utils import maybe_expand_rotation_to_6d, convert_6D_to_euler, convert_euler_to_6D
 
 logger = logging.getLogger(__name__)
 
+
+def _decode_base64_image(base64_str: str) -> np.ndarray:
+    """Decode base64 string to numpy image array (RGB format)."""
+    if base64_str is None:
+        return np.zeros((480, 640, 3), dtype=np.uint8)
+    try:
+        img_bytes = base64.b64decode(base64_str)
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return np.zeros((480, 640, 3), dtype=np.uint8)
+        # Convert BGR to RGB
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return img
+    except Exception as e:
+        logger.warning(f"Failed to decode base64 image: {e}")
+        return np.zeros((480, 640, 3), dtype=np.uint8)
+    
 
 class WallXPolicy(BasePolicy):
     """Policy wrapper for Wall-X model that implements the BasePolicy interface."""
@@ -68,7 +89,7 @@ class WallXPolicy(BasePolicy):
         self.model.to_bfloat16_for_selected_params()
 
         # hard code the action dim to 20 for align to wall-x configuration
-        self.fixed_action_dim = action_dim
+        self.fixed_action_dim = 26
 
         self.action_dim = action_dim
         self.agent_pos_dim = action_dim
@@ -136,6 +157,103 @@ class WallXPolicy(BasePolicy):
         self.buffer_index = 0
         logger.debug("Policy reset")
 
+    def _convert_x2robot_obs(self, obs: Dict) -> Dict:
+        """Convert x2robot client format to Wall-X format.
+        
+        x2robot format:
+        {
+            "state": {"follow1_pos": [...], "follow2_pos": [...], ...},
+            "views": {"camera_front": base64, "camera_left": base64, "camera_right": base64},
+            "instruction": ["task description"]
+        }
+        
+        Wall-X format:
+        {
+            "face_view": np.ndarray,
+            "left_wrist_view": np.ndarray,
+            "right_wrist_view": np.ndarray,
+            "prompt": str,
+            "state": flat_array,
+            "dataset_names": ["x2"]
+        }
+        """
+        # Check if this is x2robot format (has "views" key)
+        if "views" not in obs:
+            # Already in Wall-X format or unknown format
+            return obs
+        
+        logger.debug("Converting x2robot observation format to Wall-X format")
+        
+        converted = {}
+        
+        # 1. Convert images from base64 to numpy arrays
+        views = obs.get("views", {})
+        camera_mapping = {
+            "camera_front": "face_view",
+            "camera_left": "left_wrist_view", 
+            "camera_right": "right_wrist_view",
+        }
+        
+        for src_key, dst_key in camera_mapping.items():
+            img_data = views.get(src_key)
+            if isinstance(img_data, str):
+                # base64 encoded
+                img = _decode_base64_image(img_data)
+            elif isinstance(img_data, np.ndarray):
+                img = img_data
+            # else:
+            #     img = np.zeros((256, 256, 3), dtype=np.uint8)
+            
+            # Resize image to match training resolution
+            target_height = 256
+            # img = _resize_image_by_height(img, target_height)
+            converted[dst_key] = img
+        
+        # 2. Convert state from nested dict to flat array
+        state_dict = obs.get("state", {})
+        
+        # Extract state components in order (matching training data format)
+        # Order: follow1_pos(7) + follow2_pos(7) = 14 dims for dual-arm
+        follow1_pos = state_dict.get("follow1_pos", np.zeros(1, dtype=np.float32))
+        follow2_pos = state_dict.get("follow2_pos", np.zeros(1, dtype=np.float32))
+        
+        # Flatten to 1D arrays if needed
+        if hasattr(follow1_pos, 'flatten'):
+            follow1_pos = follow1_pos.flatten()
+        if hasattr(follow2_pos, 'flatten'):
+            follow2_pos = follow2_pos.flatten()
+        
+        # Concatenate state
+        state_flat = np.concatenate([
+            np.array(follow1_pos, dtype=np.float32),
+            np.array(follow2_pos, dtype=np.float32),
+            np.array([0]*6, dtype=np.float32),
+        ])
+        
+        converted["state"] = state_flat
+        
+        # 3. Convert instruction to prompt
+        instruction = obs.get("instruction", [""])
+        if isinstance(instruction, np.ndarray):
+            instruction = instruction.tolist()
+        if isinstance(instruction, list) and len(instruction) > 0:
+            prompt = str(instruction[0])
+        elif isinstance(instruction, str):
+            prompt = instruction
+        else:
+            prompt = self.default_prompt or "Execute the task."
+        
+        converted["prompt"] = "Place the cup of the specified color onto the plate"
+        
+        # 4. Add dataset_names (use the dataset name from training config)
+        # converted["dataset_names"] = "pick_up_cup_with_certain_color"
+        converted["dataset_names"] ="ex_normal"
+        
+        logger.debug(f"Converted obs keys: {list(converted.keys())}, state shape: {converted['state'].shape}")
+        
+        return converted
+
+
     def infer(self, obs: Dict) -> Dict:
         """Infer action from observation.
 
@@ -153,19 +271,25 @@ class WallXPolicy(BasePolicy):
         """
 
         if "state" in obs and self._obs_action_keys:
-            state = obs["state"]
-            if not isinstance(state, torch.Tensor):
-                state = torch.tensor(state, dtype=torch.float32)
-            state = maybe_expand_rotation_to_6d(
-                state, self._obs_action_keys, self._agent_pos_config
-            )
-            expected_dim = sum(self._agent_pos_config[k] for k in self._obs_action_keys)
-            if state.shape[-1] < expected_dim:
-                pad_size = expected_dim - state.shape[-1]
-                nan_pad = torch.full((*state.shape[:-1], pad_size), float("nan"))
-                state = torch.cat([state, nan_pad], dim=-1)
-            obs["state"] = state
+            obs["state"]["follow1_pos"] = np.array(obs["state"]["follow1_pos"])
+            obs["state"]["follow2_pos"] = np.array(obs["state"]["follow2_pos"])
+
+            rotation1 = convert_euler_to_6D(obs["state"]["follow1_pos"][3:6])
+            if rotation1.shape[0] == 1:
+                rotation1 = rotation1[0]
+            # print("rotation1 shape: ",rotation1.shape)
+            # print(obs["state"]["follow1_pos"].shape)
+            obs["state"]["follow1_pos"] = np.concatenate([obs["state"]["follow1_pos"][:3],rotation1,obs["state"]["follow1_pos"][6:7]],axis=0)
+
+            rotation2 = convert_euler_to_6D(obs["state"]["follow2_pos"][3:6])
+            if rotation2.shape[0] == 1:
+                rotation2 = rotation2[0]
+            obs["state"]["follow2_pos"] = np.concatenate([obs["state"]["follow2_pos"][:3],rotation2,obs["state"]["follow2_pos"][6:7]],axis=0)
         
+        obs = self._convert_x2robot_obs(obs)
+
+        state = obs.get("state")
+
         try:
             # Need to predict new actions
             input_batch = prepare_batch(
@@ -212,7 +336,21 @@ class WallXPolicy(BasePolicy):
                 .to(torch.float32)
                 .numpy()
             )
-            return {"predict_action": predicted_actions}
+            actions = predicted_actions[0]  # (T, action_dim)
+
+            # print("state.shape:",state[None,:].shape)
+            actions = state[None,:]+actions
+            
+            result = {"action": predicted_actions}
+
+            # print(result)
+
+            rotation1 = convert_6D_to_euler(actions[:, 3:9])
+            result["follow1_pos"] = np.concatenate([actions[:, :3],rotation1,actions[:, 9:10]],axis=1)
+            rotation2 = convert_6D_to_euler(actions[:, 13:19])
+            result["follow2_pos"] = np.concatenate([actions[:, 10:13],rotation2,actions[:, 19:20]],axis=1)
+            
+            return result
 
         except Exception as e:
             logger.error(f"Error during inference: {e}")

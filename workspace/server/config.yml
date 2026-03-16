@@ -1,0 +1,156 @@
+save_path: /x2robot_v2/share/bus2602/pretrain_vq_delta_6d_eef_xloss_448_0214/ckpt_ddp_1/
+log_name: pretrain_vq_delta_6d_eef_xloss_448_0214_ddp
+log_project: bus2602
+cache_dir: /x2robot_v2/share/bus2602/cache_0214/
+resume:
+  ckpt: /x2robot_v2/share/bus2602/pretrain_vq_delta_6d_eef_xloss_448_0214/ckpt_ddp_1/0_96000
+model_type: qwen2_5
+processor_path: /x2robot_v2/Models/Qwen2.5-VL-3B-Instruct
+pretrained_qwen_vl_path: /x2robot_v2/Models/Qwen2.5-VL-3B-Instruct
+qwen_vl_act_config_path: /x2robot_v2/share/bus2602/pretrain_vq_delta_6d_eef_xloss_448_0214/mot_flash_mask_causal_xloss.json
+customized_action_statistic_dof: /x2robot_v2/share/bus2602/pretrain_vq_delta_6d_eef_xloss_448_0214/dataset_type2action_stats_fused_open_priority.json
+min_key: q001
+delta_key: delta_001
+learning_rate: 0.0001
+num_epoch: 500
+gradient_accumulation_steps: 2
+batch_size_per_gpu: 4
+save_interval: 1000
+epoch_save_interval: 1
+num_warmup_steps: 8000
+num_training_steps: 1000000
+use_ema: false
+seed: 10234
+max_grad_norm: 1.0
+action_tokenizer_type: x2robot_tokenizer_v3_1_delta
+action_tokenizer:
+  action_tokenizer_checkpoint_path: /x2robot_v2/share/shiyanpei/x2robot_tokenizer/logs/x2robot_tokenizer_v3_1_delta/stage2/v3_1_delta_stage2_2048_2_4x_0113-1_x2robot_opensource/checkpoints/latest.pth
+  action_tokenizer_config_dir: /x2robot_v2/share/shiyanpei/x2robot_tokenizer/logs/x2robot_tokenizer_v3_1_delta/stage2/v3_1_delta_stage2_2048_2_4x_0113-1_x2robot_opensource/configs
+  action_tokenizer_path: null
+  action_horizon_ar: 32
+profile: false
+profile_save_path: ./profile
+profile_wait_iters: 10
+profile_warmup_iters: 5
+profile_active_iters: 2
+show_time_details: false
+use_selective_recompute: true
+use_fsdp: false
+dof_config:
+  follow_left_ee_cartesian_pos_relative: 3
+  follow_left_ee_rotation_6D_relative: 6
+  follow_left_gripper: 1
+  follow_right_ee_cartesian_pos_relative: 3
+  follow_right_ee_rotation_6D_relative: 6
+  follow_right_gripper: 1
+  velocity_decomposed: 3
+  height: 1
+  head_actions: 2
+ar_dof_config:
+  follow_left_ee_cartesian_pos_relative: 3
+  follow_left_ee_rotation_6D_relative: 6
+  follow_left_gripper: 1
+  follow_right_ee_cartesian_pos_relative: 3
+  follow_right_ee_rotation_6D_relative: 6
+  follow_right_gripper: 1
+  velocity_decomposed: 3
+  height: 1
+  head_actions: 2
+agent_pos_config:
+  follow_left_ee_cartesian_pos: 3
+  follow_left_ee_rotation_6D: 6
+  follow_left_gripper: 1
+  follow_right_ee_cartesian_pos: 3
+  follow_right_ee_rotation_6D: 6
+  follow_right_gripper: 1
+  velocity_decomposed: 3
+  height: 1
+  head_actions: 2
+use_state_string_representation: true
+max_seqlen: 1256
+ar_loss_weight: 0.01
+nvtx: false
+buffer_size: 16000
+data:
+  generate_subtask_ratio: 0.01
+  cot_ratio: 0.5
+  multimodal_data_ratio: 0.1
+  balance_sample_by_task: true
+  min_secondary_buffer_size: 3000
+  action_horizon_ar: 32
+  action_horizon_flow: 32
+  train_test_split: 0.99
+  multimodal_chunk_size: 2000
+  obs_action_keys:
+  - follow_left_ee_cartesian_pos
+  - follow_left_ee_rotation_6D
+  - follow_left_gripper
+  - follow_right_ee_cartesian_pos
+  - follow_right_ee_rotation_6D
+  - follow_right_gripper
+  - velocity_decomposed
+  - height
+  - head_actions
+  predict_action_keys:
+  - master_left_ee_cartesian_pos_relative
+  - master_left_ee_rotation_6D_relative
+  - master_left_gripper
+  - master_right_ee_cartesian_pos_relative
+  - master_right_ee_rotation_6D_relative
+  - master_right_gripper
+  - velocity_decomposed
+  - height
+  - head_actions
+  ar_predict_action_keys:
+  - master_left_ee_cartesian_pos_relative
+  - master_left_ee_rotation_6D_relative
+  - master_left_gripper
+  - master_right_ee_cartesian_pos_relative
+  - master_right_ee_rotation_6D_relative
+  - master_right_gripper
+  - velocity_decomposed
+  - height
+  - head_actions
+  resolution:
+    face_view: 448
+    left_wrist_view: 448
+    right_wrist_view: 448
+    move1_view: 448
+    move2_view: 448
+    top_view: 448
+    wall_view: 448
+    multi_modal: 448
+    side_view: 448
+    global_view: 448
+    camera_left_wrist: 448
+    camera_right_wrist: 448
+    left_side_view: 448
+    third_view: 448
+    right_side_view: 448
+  instruction_path:
+  - /open_data/subtask_instruction_for_x2/{robot_id}/{topic_id}/instruction.json
+  - '{topic_path}/instruction.json'
+  instruction_key_prob:
+    instruction: 0.1
+    distribute: 0.8
+    subtask_generation: 0.1
+  remove_static_strict: true
+  remove_static_ratio: 1.0
+  static_action_threshold: 0.004
+  use_embodied_system_prompt_ratio: 0.8
+  state_augmentation_ratio: 0.1
+  state_augmentation_prob: 0.1
+  state_augmentation_dims:
+  - 2
+  - 9
+  - 12
+  - 19
+  state_drop_prob: 0.001
+  visible_predict_ar_ratio: 0.0
+  episode_split_chunk_size: 200
+  max_epoch: 3
+  state_bins: 512
+  model_type: qwen2_5
+  use_state_string_representation: true
+dataset_config_path: /x2robot_v2/share/bus2602/pretrain_vq_delta_6d_eef_xloss_448_0214/data.yml
+visualize_sample: false

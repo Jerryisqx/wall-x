@@ -1,0 +1,129 @@
+# Training Configuration for Wall-X Robotic Multi-Modal Learning
+# This configuration supports multi-modal learning with vision, language, and action data
+
+# Model and paths configuration
+log_name: "put_opener_in_drawer"
+log_project: "github_benchmark"
+model_type: qwen2_5
+
+use_fast_tokenizer: false
+# pretrained_wallx_path: "/path/to/qwen/"
+action_tokenizer_path: "/x2robot_v2/Models/fast"
+action_tokenizer_type: 'fast'
+
+# qwen_vl_act_config_path: "/path/to/qwen25_config.json"
+
+# processor_path: "/mnt/data/x2robot_v2/yangping/ckpt/wall-oss-flow"
+pretrained_wallx_path: "/x2robot_v2/Models/Qwen2.5-VL-3B-Instruct"
+# qwen_vl_act_config_path: "/mnt/data/x2robot_v2/yangping/github/wall-x/workspace/lerobot_example/qwen25_config.json"
+
+
+
+## 从model config中选模型
+qwen_vl_act_config_path: "/x2robot_v2/yangping/github/wall-x/workspace/model_config/mot_flash_mask_v_pred_x_loss.json"
+
+resume:
+  ckpt: /x2robot_v2/share/bus2507_plus/flow/ckpt/1_500000/
+  try_harder: true
+
+seed: 10233
+# seed: 10234
+
+model_type: qwen2_5
+processor_path: "/x2robot_v2/Models/Qwen2.5-VL-3B-Instruct"
+pretrained_qwen_vl_path: "/x2robot_v2/Models/Qwen2.5-VL-3B-Instruct"  ## 以vlm的形式加载fast的模型
+
+## 如
+
+
+save_path: "/x2robot_v2/share/yangping/ckpt/robochallenge_github/rc/put_opener_in_drawer/"
+
+
+# Torch Profile
+profile: False
+profile_save_path: ./profile/
+profile_wait_iters: 10
+profile_warmup_iters: 5
+profile_active_iters: 2
+
+# Training hyperparameters
+num_warmup_steps: 1000
+num_training_steps: 64000000
+learning_rate: 0.00005
+min_lr: 0.00005
+num_epoch: 10
+gradient_accumulation_steps: 16
+batch_size_per_gpu: 4
+padding_side: left
+epoch_save_interval: 1
+
+# Robot configuration - Define degrees of freedom for each component
+dof_config:
+  follow_left_arm_joint_pos: 7      # Left end-effector Cartesian position
+  follow_right_arm_joint_pos: 7           # Left end-effector rotation
+
+# Agent proprioception configuration (typically matches DOF config)
+agent_pos_config:
+  follow_left_arm_joint_pos: 7      # Left end-effector Cartesian position
+  follow_right_arm_joint_pos: 7           # Left end-effector rotation
+
+norm_stats_path: "/x2robot_v2/yangping/github/norm/robochallenge/put_opener_in_drawer/x2/norm_stats.json"
+
+enable_customized_robot_config: true
+customized_robot_config:
+  name: "robochallenge_aloha"
+  customized_dof_config:
+    "action_all" : 14 #To match the total number of degrees of freedom
+
+  customized_agent_pos_config:
+    "state_all" : 14 #To match the total number of degrees of freedom
+
+# Checkpoint resuming configuration
+# resume:
+#   ckpt: "/path/to/ckpt"
+#   load_ckpt_only: false
+
+# Data configuration
+
+FSDP2: False
+torch_compile: False
+
+data:
+  use_lerobot: true
+
+  # LeRobot dataset configuration
+  lerobot_config:
+    repo_id: "robochallenge_aloha"
+    root: "/x2robot_v2/share/yangping/data/lerobot/Robochallenge_v2_euler_x2/aloha_4/put_opener_in_drawer"
+    episodes: null
+    image_transforms: null
+    delta_timestamps: null
+    tolerance_s: 1e-4
+    revision: null
+    force_cache_sync: false
+    download_videos: true
+    video_backend: null
+
+  action_horizon: 32
+  train_test_split: 0.95
+
+  # Action keys for observation and prediction
+  obs_action_keys:
+    - follow_left_arm_joint_pos
+    - follow_right_arm_joint_pos
+
+  predict_action_keys:
+    - follow_left_arm_joint_pos
+    - follow_right_arm_joint_pos
+    - follow_left_gripper
+
+  # Image resolution configuration for different camera views
+  resolution:
+    face_view: 256
+    left_wrist_view: 256
+    right_wrist_view: 256
+    move1_view: 256
+    move2_view: 256
+    top_view: 256
+    wall_view: 256
+    multi_modal: 256
