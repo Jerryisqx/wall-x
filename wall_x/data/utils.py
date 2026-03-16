@@ -123,6 +123,206 @@ FREQUENCY_MAPPING = {
     "viola": 20,
 }
 
+def euler_to_rotation_6d(euler_angles):
+    """Convert euler angles (xyz convention) to 6D rotation representation.
+    
+    Takes the first two columns of the rotation matrix.
+    
+    Args:
+        euler_angles: (N, 3) or (3,) numpy array of euler angles
+    Returns:
+        (N, 6) or (6,) numpy array of 6D rotation
+    """
+    squeeze = euler_angles.ndim == 1
+    if squeeze:
+        euler_angles = euler_angles.reshape(1, 3)
+    
+    N = euler_angles.shape[0]
+    rot_6d = np.empty((N, 6), dtype=np.float64)
+    
+    for i in range(N):
+        roll, pitch, yaw = euler_angles[i]
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        cr, sr = np.cos(roll), np.sin(roll)
+        
+        # First column of rotation matrix
+        rot_6d[i, 0] = cy * cp
+        rot_6d[i, 1] = sy * cp
+        rot_6d[i, 2] = -sp
+        # Second column
+        rot_6d[i, 3] = cy * sp * sr - sy * cr
+        rot_6d[i, 4] = sy * sp * sr + cy * cr
+        rot_6d[i, 5] = cp * sr
+    
+    return rot_6d.squeeze() if squeeze else rot_6d
+
+_ROTATION_6D_HINT = "rotation_6D"
+
+def maybe_expand_rotation_to_6d(flat_tensor, action_keys, config_dims):
+    """如果 config 中有 rotation_6D key，自动将 flat tensor 中对应的
+    3D euler 段扩展为 6D rotation。
+    
+    Args:
+        flat_tensor: torch.Tensor, shape (..., D_raw)
+        action_keys: list of key names (obs_action_keys 或 predict_action_keys)
+        config_dims: dict {key: model_expected_dim}
+    Returns:
+        torch.Tensor, shape (..., D_model)
+    """
+    # 快速判断：如果没有 rotation_6D key，直接返回
+    if not any(_ROTATION_6D_HINT in k for k in action_keys):
+        return flat_tensor
+    
+    # 计算 raw 维度布局 (数据中实际存的维度)
+    raw_dims = []
+    convert_flags = []
+    for key in action_keys:
+        model_dim = config_dims[key]
+        if _ROTATION_6D_HINT in key and model_dim == 6:
+            raw_dims.append(3)
+            convert_flags.append(True)
+        else:
+            raw_dims.append(model_dim)
+            convert_flags.append(False)
+    
+    expected_raw = sum(raw_dims)
+    expected_model = sum(config_dims[k] for k in action_keys)
+    actual_dim = flat_tensor.shape[-1]
+    
+    # 如果已经是模型维度，不需要转换
+    if actual_dim == expected_model:
+        return flat_tensor
+    # 如果不匹配 raw 维度，原样返回
+    if actual_dim != expected_raw:
+        return flat_tensor
+    
+    original_shape = flat_tensor.shape[:-1]
+    flat = flat_tensor.reshape(-1, actual_dim)
+    
+    segments = []
+    idx = 0
+    for i, key in enumerate(action_keys):
+        seg = flat[:, idx:idx + raw_dims[i]]
+        if convert_flags[i]:
+            seg_np = seg.cpu().numpy().astype(np.float64)
+            converted = np.stack([
+                euler_to_rotation_6d(row.reshape(1, 3)).flatten()
+                for row in seg_np
+            ])
+            seg = torch.from_numpy(converted).to(
+                dtype=flat_tensor.dtype, device=flat_tensor.device
+            )
+        segments.append(seg)
+        idx += raw_dims[i]
+    
+    result = torch.cat(segments, dim=-1)
+    return result.reshape(*original_shape, -1)
+
+
+def infer_present_keys(actual_dim, config_keys, config_dims):
+    """Infer which config keys have actual data based on tensor dimension.
+
+    Walks config_keys in order, accumulating raw dimensions (treating
+    rotation_6D as 3D in raw data). Stops when adding the next key would
+    exceed actual_dim.
+    """
+    present = []
+    acc = 0
+    for k in config_keys:
+        raw_d = 3 if (_ROTATION_6D_HINT in k and config_dims[k] == 6) else config_dims[k]
+        if acc + raw_d <= actual_dim:
+            present.append(k)
+            acc += raw_d
+        else:
+            break
+    return present
+
+
+def pad_tensor_with_nan(tensor, target_dim):
+    """Pad the last dimension of tensor with NaN to reach target_dim."""
+    current_dim = tensor.shape[-1]
+    if current_dim >= target_dim:
+        return tensor
+    pad_size = target_dim - current_dim
+    nan_pad = torch.full(
+        (*tensor.shape[:-1], pad_size), float("nan"),
+        dtype=tensor.dtype, device=tensor.device,
+    )
+    return torch.cat([tensor, nan_pad], dim=-1)
+
+
+def _strip_6d_suffix(key):
+    """Map a config key to its raw data equivalent by removing _6D suffix."""
+    return key.replace("_rotation_6D", "_rotation").replace("_ee_rotation_6D", "_ee_rotation")
+
+
+def expand_flat_tensor_to_config(
+    flat_tensor,
+    data_keys,
+    data_dims,
+    config_keys,
+    config_dims,
+):
+    """Expand a flat tensor from data layout to config layout.
+
+    Handles three transformations:
+      1. 3D euler -> 6D rotation for rotation_6D keys
+      2. NaN padding for keys present in config but missing in data
+      3. Passthrough for keys that exist in both
+
+    Args:
+        flat_tensor: torch.Tensor, shape (..., D_data)
+        data_keys: list of key names the data actually contains
+        data_dims: list of ints, dimension per data key (same order as data_keys)
+        config_keys: list of key names the model config expects
+        config_dims: dict {config_key: expected_dim}
+
+    Returns:
+        torch.Tensor, shape (..., D_config) with NaN for missing keys
+    """
+    original_shape = flat_tensor.shape[:-1]
+    actual_dim = flat_tensor.shape[-1]
+    flat = flat_tensor.reshape(-1, actual_dim)
+    batch = flat.shape[0]
+
+    data_key_to_slice = {}
+    offset = 0
+    for key, dim in zip(data_keys, data_dims):
+        data_key_to_slice[key] = (offset, offset + dim)
+        offset += dim
+
+    segments = []
+    for cfg_key in config_keys:
+        target_dim = config_dims[cfg_key]
+        raw_key = _strip_6d_suffix(cfg_key)
+
+        if raw_key in data_key_to_slice:
+            s, e = data_key_to_slice[raw_key]
+            seg = flat[:, s:e]
+            if _ROTATION_6D_HINT in cfg_key and target_dim == 6 and (e - s) == 3:
+                seg_np = seg.cpu().numpy().astype(np.float64)
+                converted = np.stack([
+                    euler_to_rotation_6d(row.reshape(1, 3)).flatten()
+                    for row in seg_np
+                ])
+                seg = torch.from_numpy(converted).to(
+                    dtype=flat_tensor.dtype, device=flat_tensor.device
+                )
+            segments.append(seg)
+        elif cfg_key in data_key_to_slice:
+            s, e = data_key_to_slice[cfg_key]
+            segments.append(flat[:, s:e])
+        else:
+            nan_seg = torch.full(
+                (batch, target_dim), float("nan"),
+                dtype=flat_tensor.dtype, device=flat_tensor.device,
+            )
+            segments.append(nan_seg)
+
+    result = torch.cat(segments, dim=-1)
+    return result.reshape(*original_shape, -1)
+
 
 def preprocesser_call(
     processor,

@@ -108,9 +108,8 @@ def prepare_batch(
         if state.dim() == 2:
             state = state.unsqueeze(1)  # [batch, 1, state_dim]
 
-        agent_pos_mask = torch.ones_like(state)
-        if state.shape[-1] > agent_pos_dim:
-            agent_pos_mask[:, :, agent_pos_dim:] = 0
+        agent_pos_mask = (~torch.isnan(state)).float()
+        state = torch.nan_to_num(state, nan=0.0)
 
         state = normalizer_propri.normalize_data(state, [obs["dataset_names"]] * state.shape[0])
 

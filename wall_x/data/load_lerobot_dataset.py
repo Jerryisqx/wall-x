@@ -18,6 +18,7 @@ from wall_x.data.utils import (
 
 from transformers import AutoProcessor
 from .utils import KEY_MAPPINGS
+from wall_x.data.utils import maybe_expand_rotation_to_6d, infer_present_keys, pad_tensor_with_nan
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -128,6 +129,20 @@ class PreprocessedDataset(Dataset[T_co]):
         image_inputs, h, w, resize_h, resize_w = self._vision_preprocess(data)
         agent_pos = data[self._state_key_mapping["state"]]
         action = data[self._action_key_mapping["action"]]
+        
+        obs_keys = self.dataload_config["obs_action_keys"]
+        pred_keys = self.dataload_config["predict_action_keys"]
+        agent_pos_cfg = self.config["agent_pos_config"]
+        dof_cfg = self.config["dof_config"]
+
+        state_present_keys = infer_present_keys(agent_pos.shape[-1], obs_keys, agent_pos_cfg)
+        agent_pos = maybe_expand_rotation_to_6d(agent_pos, state_present_keys, agent_pos_cfg)
+        agent_pos = pad_tensor_with_nan(agent_pos, sum(agent_pos_cfg[k] for k in obs_keys))
+
+        action_present_keys = infer_present_keys(action.shape[-1], pred_keys, dof_cfg)
+        action = maybe_expand_rotation_to_6d(action, action_present_keys, dof_cfg)
+        action = pad_tensor_with_nan(action, sum(dof_cfg[k] for k in pred_keys))
+
         frame_index = data["frame_index"]
         instruction_info = {"instruction": data["task"]}
         generate_subtask_ratio = self.data_config.generate_subtask_ratio

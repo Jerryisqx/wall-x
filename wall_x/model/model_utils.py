@@ -92,7 +92,7 @@ def register_normalizers(config, model_path):
     #         delta_key=config.get("delta_key", "delta"),
     #     )
     action_statistic_dof = None
-    stat_path = config.get("customized_action_statistic_dof", None)
+    stat_path = config.get("norm_stats_path", None)
     # stat_path = "/x2robot_v2/share/bus2602/pretrain_vq_delta_6d_eef_xloss_448_0214/dataset_type2action_stats_fused_open_priority.json"
     if stat_path and os.path.exists(stat_path):
         with open(stat_path, "r") as f:

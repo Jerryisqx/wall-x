@@ -7,6 +7,7 @@ from wall_x.serving.websocket_policy_server import BasePolicy
 from wall_x.model.qwen2_5_based.modeling_qwen2_5_vl_act import Qwen2_5_VLMoEForAction
 from wall_x.serving.policy.utils import prepare_batch
 from wall_x.model.model_utils import load_wallx_processors, register_normalizers
+from wall_x.data.utils import maybe_expand_rotation_to_6d
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,9 @@ class WallXPolicy(BasePolicy):
             "use_state_string_representation", train_config.get("use_state_string_representation", False)
         )
         self.state_bins = train_config.get("data", {}).get("state_bins", 512)
+        self._obs_action_keys = train_config.get("data", {}).get("obs_action_keys", [])
+        self._agent_pos_config = train_config.get("agent_pos_config", {})
+
 
         print("predict_mode", predict_mode)
         print("camera_key", camera_key)
@@ -147,6 +151,21 @@ class WallXPolicy(BasePolicy):
                 - 'action': Predicted action (numpy array)
                 - Additional metadata
         """
+
+        if "state" in obs and self._obs_action_keys:
+            state = obs["state"]
+            if not isinstance(state, torch.Tensor):
+                state = torch.tensor(state, dtype=torch.float32)
+            state = maybe_expand_rotation_to_6d(
+                state, self._obs_action_keys, self._agent_pos_config
+            )
+            expected_dim = sum(self._agent_pos_config[k] for k in self._obs_action_keys)
+            if state.shape[-1] < expected_dim:
+                pad_size = expected_dim - state.shape[-1]
+                nan_pad = torch.full((*state.shape[:-1], pad_size), float("nan"))
+                state = torch.cat([state, nan_pad], dim=-1)
+            obs["state"] = state
+        
         try:
             # Need to predict new actions
             input_batch = prepare_batch(
