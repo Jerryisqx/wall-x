@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 
 import torch
+from scipy.spatial.transform import Rotation
 from transformers import BatchFeature
 
 KEY_MAPPINGS = {
@@ -123,39 +124,82 @@ FREQUENCY_MAPPING = {
     "viola": 20,
 }
 
-def euler_to_rotation_6d(euler_angles):
-    """Convert euler angles (xyz convention) to 6D rotation representation.
-    
-    Takes the first two columns of the rotation matrix.
-    
+def euler_to_rotation_6d(euler_angle):
+    """Convert euler angle to 6D rotation representation.
+
+    Uses the first two columns of the rotation matrix as the 6D representation.
+
     Args:
-        euler_angles: (N, 3) or (3,) numpy array of euler angles
+        euler_angle: numpy array of shape (N, 3) or (3,)
     Returns:
-        (N, 6) or (6,) numpy array of 6D rotation
+        numpy array of shape (N, 6) or (6,). Only squeezes when input was 1D.
     """
-    squeeze = euler_angles.ndim == 1
-    if squeeze:
-        euler_angles = euler_angles.reshape(1, 3)
-    
-    N = euler_angles.shape[0]
-    rot_6d = np.empty((N, 6), dtype=np.float64)
-    
-    for i in range(N):
-        roll, pitch, yaw = euler_angles[i]
-        cy, sy = np.cos(yaw), np.sin(yaw)
-        cp, sp = np.cos(pitch), np.sin(pitch)
-        cr, sr = np.cos(roll), np.sin(roll)
-        
-        # First column of rotation matrix
-        rot_6d[i, 0] = cy * cp
-        rot_6d[i, 1] = sy * cp
-        rot_6d[i, 2] = -sp
-        # Second column
-        rot_6d[i, 3] = cy * sp * sr - sy * cr
-        rot_6d[i, 4] = sy * sp * sr + cy * cr
-        rot_6d[i, 5] = cp * sr
-    
-    return rot_6d.squeeze() if squeeze else rot_6d
+    was_1d = (len(euler_angle.shape) == 1)
+    if was_1d:
+        euler_angle = euler_angle.reshape(1, 3)
+    rotation_matrix = Rotation.from_euler("xyz", euler_angle).as_matrix()
+    rotation_6d = np.zeros((euler_angle.shape[0], 6))
+    rotation_6d[:, :3] = rotation_matrix[:, :, 0]
+    rotation_6d[:, 3:] = rotation_matrix[:, :, 1]
+    return rotation_6d.squeeze() if was_1d else rotation_6d
+
+
+def rotation_6d_to_euler(rotation_6d):
+    """Convert 6D rotation representation back to euler angles (xyz convention).
+
+    Reconstructs the rotation matrix from its first two columns (third column
+    via cross product) and extracts xyz euler angles.
+
+    Args:
+        rotation_6d: numpy array of shape (N, 6) or (6,)
+    Returns:
+        numpy array of shape (N, 3) or (3,). Only squeezes when input was 1D.
+    """
+    was_1d = (len(rotation_6d.shape) == 1)
+    if was_1d:
+        rotation_6d = rotation_6d.reshape(1, 6)
+    if len(rotation_6d.shape) == 3:
+        rotation_6d = rotation_6d.reshape(-1, 6)
+    rotation_matrix = np.zeros((rotation_6d.shape[0], 3, 3))
+    rotation_matrix[:, :, 0] = rotation_6d[:, :3]
+    rotation_matrix[:, :, 1] = rotation_6d[:, 3:6]
+    rotation_matrix[:, :, 2] = np.cross(
+        rotation_matrix[:, :, 0], rotation_matrix[:, :, 1]
+    )
+    euler_angle = Rotation.from_matrix(rotation_matrix).as_euler("xyz")
+    return euler_angle.squeeze() if was_1d else euler_angle
+
+
+def contract_action_6d_to_3d(action_flat, predict_action_keys, config_dims):
+    """Convert 6D rotation fields back to 3D euler in a flat action array.
+
+    Walks through predict_action_keys: for rotation_6D fields (dim=6),
+    converts to 3D euler; other fields pass through unchanged.
+
+    Args:
+        action_flat: numpy array, shape (..., D_model)
+        predict_action_keys: list of action key names
+        config_dims: dict {key: dim}
+    Returns:
+        numpy array with rotation_6D fields contracted to 3D
+    """
+    original_shape = action_flat.shape[:-1]
+    flat = action_flat.reshape(-1, action_flat.shape[-1])
+
+    segments = []
+    idx = 0
+    for key in predict_action_keys:
+        dim = config_dims[key]
+        seg = flat[:, idx:idx + dim]
+        if "rotation_6D" in key and dim == 6:
+            segments.append(rotation_6d_to_euler(seg))
+        else:
+            segments.append(seg)
+        idx += dim
+
+    result = np.concatenate(segments, axis=-1)
+    return result.reshape(*original_shape, -1)
+
 
 _ROTATION_6D_HINT = "rotation_6D"
 
@@ -206,10 +250,7 @@ def maybe_expand_rotation_to_6d(flat_tensor, action_keys, config_dims):
         seg = flat[:, idx:idx + raw_dims[i]]
         if convert_flags[i]:
             seg_np = seg.cpu().numpy().astype(np.float64)
-            converted = np.stack([
-                euler_to_rotation_6d(row.reshape(1, 3)).flatten()
-                for row in seg_np
-            ])
+            converted = euler_to_rotation_6d(seg_np)
             seg = torch.from_numpy(converted).to(
                 dtype=flat_tensor.dtype, device=flat_tensor.device
             )
@@ -302,10 +343,7 @@ def expand_flat_tensor_to_config(
             seg = flat[:, s:e]
             if _ROTATION_6D_HINT in cfg_key and target_dim == 6 and (e - s) == 3:
                 seg_np = seg.cpu().numpy().astype(np.float64)
-                converted = np.stack([
-                    euler_to_rotation_6d(row.reshape(1, 3)).flatten()
-                    for row in seg_np
-                ])
+                converted = euler_to_rotation_6d(seg_np)
                 seg = torch.from_numpy(converted).to(
                     dtype=flat_tensor.dtype, device=flat_tensor.device
                 )

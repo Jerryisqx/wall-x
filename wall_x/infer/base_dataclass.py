@@ -3,7 +3,9 @@ from typing import Optional, List
 from dataclasses import dataclass, field
 import numpy as np
 import torch
+
 import wall_x.infer.data_utils as data_utils
+# import x2robot_dataset.common.data_utils as data_utils
 from wall_x.infer.logger import InferLogger
 
 dof_dims = {
@@ -203,10 +205,10 @@ class RobotStateActionData:
                 else None
             ),
         )
-        self.data.register_compute_rule(  # delta 6D -> abs 6D -> abs rpy
+        self.data.register_compute_rule(  # delta 6D -> abs 6D
             "action_left_ee_rotation_6D",
             lambda d: (
-                data_utils.compose_state_and_delta_to_abs_rpy(
+                data_utils.compose_state_and_delta_to_abs_6d(
                     d["action_left_ee_rotation_6D_relative"],
                     d["state_left_ee_rotation_6D"][0],
                 )
@@ -236,10 +238,10 @@ class RobotStateActionData:
                 else None
             ),
         )
-        self.data.register_compute_rule(  # delta 6D -> abs 6D -> abs rpy
+        self.data.register_compute_rule(  # delta 6D -> abs 6D
             "action_right_ee_rotation_6D",
             lambda d: (
-                data_utils.compose_state_and_delta_to_abs_rpy(
+                data_utils.compose_state_and_delta_to_abs_6d(
                     d["action_right_ee_rotation_6D_relative"],
                     d["state_right_ee_rotation_6D"][0],
                 )

@@ -19,6 +19,7 @@ from wall_x.data.utils import (
 from transformers import AutoProcessor
 from .utils import KEY_MAPPINGS
 from wall_x.data.utils import maybe_expand_rotation_to_6d, infer_present_keys, pad_tensor_with_nan
+import wall_x.infer.data_utils as infer_data_utils
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -142,6 +143,27 @@ class PreprocessedDataset(Dataset[T_co]):
         action_present_keys = infer_present_keys(action.shape[-1], pred_keys, dof_cfg)
         action = maybe_expand_rotation_to_6d(action, action_present_keys, dof_cfg)
         action = pad_tensor_with_nan(action, sum(dof_cfg[k] for k in pred_keys))
+
+        if any("relative" in k for k in pred_keys):
+            action_np = action.numpy().astype(np.float64)
+            state_np = agent_pos.numpy().astype(np.float64)
+            was_1d = action_np.ndim == 1
+            if was_1d:
+                action_np = action_np[np.newaxis, :]
+            idx = 0
+            for pred_k, dof_k in zip(pred_keys, dof_cfg):
+                dim = dof_cfg[dof_k]
+                if "relative" in pred_k:
+                    seg = action_np[:, idx:idx + dim]
+                    st = state_np[idx:idx + dim] if state_np.ndim == 1 else state_np[:1, idx:idx + dim].squeeze(0)
+                    if "rotation" in dof_k and not np.isnan(seg).any() and not np.isnan(st).any():
+                        action_np[:, idx:idx + dim] = infer_data_utils.compute_delta_from_state_and_abs_rot(seg, st)
+                    elif not np.isnan(seg).any() and not np.isnan(st).any():
+                        action_np[:, idx:idx + dim] = seg - st
+                idx += dim
+            if was_1d:
+                action_np = action_np.squeeze(0)
+            action = torch.from_numpy(action_np).to(action.dtype)
 
         frame_index = data["frame_index"]
         instruction_info = {"instruction": data["task"]}
