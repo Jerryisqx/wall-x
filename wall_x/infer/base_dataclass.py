@@ -263,6 +263,10 @@ class RobotStateActionData:
             elif key.startswith("master_"):
                 key = key.replace("master_", "")
 
+            # State is always absolute; strip _relative suffix
+            if key.endswith("_relative"):
+                key = key[: -len("_relative")]
+
             # Add state_ prefix to access state data
             state_key = f"state_{key}"
 
@@ -292,6 +296,10 @@ class RobotStateActionData:
                 key = key.replace("follow_", "")
             elif key.startswith("master_"):
                 key = key.replace("master_", "")
+
+            # State is always absolute; strip _relative suffix
+            if key.endswith("_relative"):
+                key = key[: -len("_relative")]
 
             # Add state_ prefix to access state data
             state_key = f"state_{key}"

@@ -7,7 +7,6 @@ import cv2
 import os
 import json
 import base64
-import yaml
 from matplotlib import pyplot as plt
 
 m.patch()
@@ -45,6 +44,7 @@ def plot_openloop(action_pred_list, action_gt_list, save_path, dim_labels=None):
     plt.tight_layout(rect=[0, 0, 1, 0.98])
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(f"{save_path}.jpg", dpi=200)
+    plt.close()
     print(f"Saved plot to {save_path}.jpg")
 
 
@@ -55,7 +55,14 @@ def _build_follow_pos(traj, side):
     grip = traj.get(f"follow_{side}_gripper", 0)
     if not isinstance(grip, list):
         grip = [grip]
-    return list(pos) + list(rot) + list(grip)
+    return np.array(list(pos) + list(rot) + list(grip), dtype=np.float32)
+
+
+def _encode_image(image_rgb: np.ndarray) -> str:
+    """Encode RGB numpy image to base64 JPEG string (x2robot_client format)."""
+    img_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    _, buffer = cv2.imencode(".jpg", img_bgr)
+    return base64.b64encode(buffer).decode("utf-8")
 
 
 def load_vla_case_data(case_path, sample_name):
@@ -94,21 +101,31 @@ def load_vla_case_data(case_path, sample_name):
     return data
 
 
-def encode_image(image):
-    _, buffer = cv2.imencode(".jpg", image)
-    return base64.b64encode(buffer).decode("utf-8")
-
-
 async def run_vla_evaluation(uri, data_dir, save_dir, sample_nums=1):
 
     report_path = os.path.join(data_dir, "report.json")
     with open(report_path, "r") as f:
         samples = json.load(f)["sample_name"]
 
-    async with websockets.connect(uri) as websocket:
-        print(f"Connected to VLA Server")
+    instruction_path = os.path.join(data_dir, "instruction.json")
+    instruction_dict = {}
+    if os.path.exists(instruction_path):
+        with open(instruction_path, "r") as f:
+            instruction_dict = json.load(f)
+
+    async with websockets.connect(uri, max_size=None) as websocket:
+        metadata = msgpack.unpackb(await websocket.recv())
+        print(f"Connected to VLA Server, metadata: {metadata}")
 
         for sample in samples[:sample_nums]:
+
+            sample_instruction = instruction_dict.get(sample, {})
+            if isinstance(sample_instruction, dict):
+                prompt = sample_instruction.get("instruction", "")
+            else:
+                prompt = str(sample_instruction) if sample_instruction else ""
+            print(f"Prompt: {prompt}")
+
             sample_path = os.path.join(data_dir, sample)
             save_path = os.path.join(save_dir, sample)
             print(f"\nProcessing: {sample}")
@@ -133,39 +150,38 @@ async def run_vla_evaluation(uri, data_dir, save_dir, sample_nums=1):
                         "follow1_pos": _build_follow_pos(traj, "left"),
                         "follow2_pos": _build_follow_pos(traj, "right"),
                     },
-                    "camera_front": case_data["face_frames"][idx],
-                    "camera_left": case_data["left_frames"][idx],
-                    "camera_right": case_data["right_frames"][idx],
-                    "prompt": "Put the cup on the plate.",
-                    "dataset_names": "x2_normal",
+                    "views": {
+                        "camera_front": _encode_image(case_data["face_frames"][idx]),
+                        "camera_left": _encode_image(case_data["left_frames"][idx]),
+                        "camera_right": _encode_image(case_data["right_frames"][idx]),
+                    },
+                    "instruction": prompt,
                 }
 
-                result = None
-                while True:
-                    binary_data = msgpack.packb(payload, use_bin_type=True)
-                    await websocket.send(binary_data)
+                binary_data = msgpack.packb(payload, use_bin_type=True)
+                await websocket.send(binary_data)
 
-                    response = await websocket.recv()
-                    if isinstance(response, str):
-                        raise RuntimeError(f"Server error: {response}")
-                    result = msgpack.unpackb(response, raw=False)
+                response = await websocket.recv()
+                if isinstance(response, str):
+                    raise RuntimeError(f"Server error: {response}")
+                result = msgpack.unpackb(response, raw=False)
 
-                    if "follow1_pos" in result or "predict_action" in result:
-                        break
+                if "follow1_pos" not in result:
+                    raise RuntimeError(
+                        f"Server did not return follow1_pos, got keys: {list(result.keys())}"
+                    )
 
-                if "follow1_pos" in result:
-                    follow1 = np.array(result["follow1_pos"])
-                    follow2 = np.array(result["follow2_pos"])
-                    action_step = np.concatenate([follow1[1], follow2[1]], axis=0).tolist()
-                else:
-                    predict_action = np.array(result["predict_action"])
-                    action_step = predict_action[0, 0].tolist()
+                follow1 = np.array(result["follow1_pos"])
+                follow2 = np.array(result["follow2_pos"])
+                action_step = np.concatenate([follow1[1], follow2[1]], axis=0).tolist()
 
                 if idx > 0:
                     idx += 1
 
                 gt_traj = trajectory[min(idx, len(trajectory) - 1)]
-                gt_step = _build_follow_pos(gt_traj, "left") + _build_follow_pos(gt_traj, "right")
+                gt_left = _build_follow_pos(gt_traj, "left")
+                gt_right = _build_follow_pos(gt_traj, "right")
+                gt_step = np.concatenate([gt_left, gt_right]).tolist()
                 action_gt.append(gt_step)
                 action_pred.append(action_step)
 
@@ -179,16 +195,18 @@ async def run_vla_evaluation(uri, data_dir, save_dir, sample_nums=1):
 
 
 if __name__ == "__main__":
-    try:
-        uri = "ws://localhost:42100"
-        data_dir = "/x2robot_data/zhengwei/10053/20250526-day-pick-up_cup-train"
-        save_dir = (
-            "/mnt/data/x2robot_v2/jerry1/open-wallx/logs/openloop/pick_up_cup_bus2602_bs256_ep3"
-        )
+    import argparse
 
-        sample_nums = 1
+    parser = argparse.ArgumentParser(description="Open-loop evaluation via websocket")
+    parser.add_argument("--uri", default="ws://localhost:42100", help="Server websocket URI")
+    parser.add_argument("--data-dir", required=True, help="Path to evaluation data directory")
+    parser.add_argument("--save-dir", required=True, help="Path to save plots")
+    parser.add_argument("--sample-nums", type=int, default=1, help="Number of samples to evaluate")
+    args = parser.parse_args()
+
+    try:
         asyncio.run(
-            run_vla_evaluation(uri, data_dir, save_dir, sample_nums)
+            run_vla_evaluation(args.uri, args.data_dir, args.save_dir, args.sample_nums)
         )
     except KeyboardInterrupt:
         print("\nEvaluation stopped by user.")

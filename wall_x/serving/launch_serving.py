@@ -55,6 +55,8 @@ class ModelConfig:
     dtype: str = "bfloat16"
     # Prediction mode (fast or slow)
     predict_mode: str = "fast"
+    # Dataset name used as normalizer key (must match norm_stats keys)
+    dataset_name: str = "ex_normal"
     # Camera key for the environment
     camera_key: List[str] = field(
         default_factory=lambda: ["front_view", "left_wrist_view", "right_wrist_view"]
@@ -156,6 +158,7 @@ def create_policy(args: Args) -> WallXPolicy:
         dtype=config.dtype,
         predict_mode=config.predict_mode,
         default_prompt=args.default_prompt,
+        dataset_name=config.dataset_name,
         camera_key=config.camera_key,
     )
 

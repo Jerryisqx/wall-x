@@ -35,7 +35,7 @@ def prepare_batch(
             - 'camera_key_0' : image 0
             - 'camera_key_1' : image 1
             ...
-            - 'prompt': Text prompt
+            - 'instruction' or 'prompt': Task instruction text
             - 'state': Robot state/proprioception
             - 'dataset_names': Dataset names
 
@@ -120,8 +120,7 @@ def prepare_batch(
             mask_np = agent_pos_mask[:, 0, :].cpu().numpy().astype(bool) if isinstance(agent_pos_mask, torch.Tensor) else agent_pos_mask[:, 0, :].astype(bool)
             propri_string = " ".join(map(str, discretized[0, mask_np[0]]))
 
-    # Handle text prompt - format with vision tokens
-    instruction = obs["prompt"]
+    instruction = obs.get("instruction") or obs.get("prompt", "")
     formatted_text = format_text_with_vision_tokens(
         instruction, camera_key, predict_mode, pred_horizon, propri_string=propri_string
     )
