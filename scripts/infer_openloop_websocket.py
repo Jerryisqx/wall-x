@@ -7,6 +7,7 @@ import cv2
 import os
 import json
 import base64
+import argparse
 from matplotlib import pyplot as plt
 
 m.patch()
@@ -101,7 +102,8 @@ def load_vla_case_data(case_path, sample_name):
     return data
 
 
-async def run_vla_evaluation(uri, data_dir, save_dir, sample_nums=1):
+async def run_vla_evaluation(uri, data_dir, save_dir, sample_nums=1,
+                             action_chunk=1, max_steps=300):
 
     report_path = os.path.join(data_dir, "report.json")
     with open(report_path, "r") as f:
@@ -116,15 +118,16 @@ async def run_vla_evaluation(uri, data_dir, save_dir, sample_nums=1):
     async with websockets.connect(uri, max_size=None) as websocket:
         metadata = msgpack.unpackb(await websocket.recv())
         print(f"Connected to VLA Server, metadata: {metadata}")
+        print(f"action_chunk={action_chunk}, max_steps={max_steps}")
 
         for sample in samples[:sample_nums]:
 
             sample_instruction = instruction_dict.get(sample, {})
             if isinstance(sample_instruction, dict):
-                prompt = sample_instruction.get("instruction", "")
+                instruction = sample_instruction.get("instruction", "")
             else:
-                prompt = str(sample_instruction) if sample_instruction else ""
-            print(f"Prompt: {prompt}")
+                instruction = str(sample_instruction) if sample_instruction else ""
+            print(f"Prompt: {instruction}")
 
             sample_path = os.path.join(data_dir, sample)
             save_path = os.path.join(save_dir, sample)
@@ -155,7 +158,7 @@ async def run_vla_evaluation(uri, data_dir, save_dir, sample_nums=1):
                         "camera_left": _encode_image(case_data["left_frames"][idx]),
                         "camera_right": _encode_image(case_data["right_frames"][idx]),
                     },
-                    "instruction": prompt,
+                    "instruction": instruction,
                 }
 
                 binary_data = msgpack.packb(payload, use_bin_type=True)
@@ -171,42 +174,52 @@ async def run_vla_evaluation(uri, data_dir, save_dir, sample_nums=1):
                         f"Server did not return follow1_pos, got keys: {list(result.keys())}"
                     )
 
-                follow1 = np.array(result["follow1_pos"])
+                follow1 = np.array(result["follow1_pos"])  # (T+1, 7)
                 follow2 = np.array(result["follow2_pos"])
-                action_step = np.concatenate([follow1[1], follow2[1]], axis=0).tolist()
+                pred_combined = np.concatenate([follow1, follow2], axis=1)  # (T+1, 14)
 
-                if idx > 0:
-                    idx += 1
+                n_take = min(action_chunk, len(follow1) - 1, num_steps - idx)
+                for k in range(n_take):
+                    action_pred.append(pred_combined[1 + k].tolist())
+                    gt_idx = min(idx + 1 + k, len(trajectory) - 1)
+                    gt_traj = trajectory[gt_idx]
+                    gt_step = np.concatenate([
+                        _build_follow_pos(gt_traj, "left"),
+                        _build_follow_pos(gt_traj, "right"),
+                    ]).tolist()
+                    action_gt.append(gt_step)
 
-                gt_traj = trajectory[min(idx, len(trajectory) - 1)]
-                gt_left = _build_follow_pos(gt_traj, "left")
-                gt_right = _build_follow_pos(gt_traj, "right")
-                gt_step = np.concatenate([gt_left, gt_right]).tolist()
-                action_gt.append(gt_step)
-                action_pred.append(action_step)
+                idx += n_take
+                print(
+                    f"  step {len(action_pred)}: took {n_take} actions, "
+                    f"next obs @{idx}"
+                )
 
-                print(f"step {len(action_pred)}: pred_dim={len(action_step)}, gt_dim={len(gt_step)}")
-
-                if len(action_pred) > 150:
-                    break
+                # if len(action_pred) >= max_steps:
+                #     break
 
             ml = min(len(action_pred), len(action_gt))
             plot_openloop(action_pred[:ml], action_gt[:ml], save_path, _ACTION_LABELS)
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description="Open-loop evaluation via websocket")
     parser.add_argument("--uri", default="ws://localhost:42100", help="Server websocket URI")
     parser.add_argument("--data-dir", required=True, help="Path to evaluation data directory")
     parser.add_argument("--save-dir", required=True, help="Path to save plots")
     parser.add_argument("--sample-nums", type=int, default=1, help="Number of samples to evaluate")
+    parser.add_argument("--action-chunk", type=int, default=1,
+                        help="Number of actions to take from each prediction (1=single-step, >1=chunk)")
+    parser.add_argument("--max-steps", type=int, default=300,
+                        help="Maximum number of steps to evaluate per sample")
     args = parser.parse_args()
 
     try:
         asyncio.run(
-            run_vla_evaluation(args.uri, args.data_dir, args.save_dir, args.sample_nums)
+            run_vla_evaluation(
+                args.uri, args.data_dir, args.save_dir,
+                args.sample_nums, args.action_chunk, args.max_steps,
+            )
         )
     except KeyboardInterrupt:
         print("\nEvaluation stopped by user.")
