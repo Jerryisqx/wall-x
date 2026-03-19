@@ -936,7 +936,7 @@ def main(
     fps: int,
     repo_id: str
 ):  
-    output_path = Path("/x2robot_v2/share/yangping/data/lerobot/bright/desk_distribute_fruits_jl")
+    output_path = Path("/x2robot_v2/share/yangping/data/lerobot/bright/letters_task")
     dataset = X2LeRobotDataset.create(
         repo_id = repo_id,
         root = output_path,
@@ -963,21 +963,81 @@ def main(
     #     "/x2robot_data/zhengwei/10157/20260126-day-pick_up_cup_with_certain_color_2-1"
     # ]
 
-    src_path_list = [
-        "/x2robot_data/zhengwei/10153/20260313-day-desk_distribute_fruits_jl",
-        "/x2robot_data/zhengwei/10153/20260312-day-desk_distribute_fruits_jl",
-        "/x2robot_data/zhengwei/10155/20260313-day-desk_distribute_fruits_jl",
-        "/x2robot_data/zhengwei/10155/20260312-night-desk_distribute_fruits_jl",
-        "/x2robot_data/zhengwei/10152/20260311-day-desk_distribute_fruits_jl",
-        "/x2robot_data/zhengwei/10152/20260311-night-desk_distribute_fruits_jl",
-        "/x2robot_data/zhengwei/10158/20260311-day-desk_distribute_fruits_jl",
-        "/x2robot_data/zhengwei/10158/20260311-night-desk_distribute_fruits_jl",
-        "/x2robot_data/zhengwei/10159/20260311-night-desk_distribute_fruits_jl",
-        "/x2robot_data/zhengwei/10159/20260311-day-desk_distribute_fruits_jl",
-        "/x2robot_data/zhengwei/10165/20260311-night-desk_distribute_fruits_jl",
-        "/x2robot_data/zhengwei/10353/20260311-night-desk_distribute_fruits_jl",
-    ]
+    # src_path_list = [
+    #     "/x2robot_data/zhengwei/10153/20260313-day-desk_distribute_fruits_jl",
+    #     "/x2robot_data/zhengwei/10153/20260312-day-desk_distribute_fruits_jl",
+    #     "/x2robot_data/zhengwei/10155/20260313-day-desk_distribute_fruits_jl",
+    #     "/x2robot_data/zhengwei/10155/20260312-night-desk_distribute_fruits_jl",
+    #     "/x2robot_data/zhengwei/10152/20260311-day-desk_distribute_fruits_jl",
+    #     "/x2robot_data/zhengwei/10152/20260311-night-desk_distribute_fruits_jl",
+    #     "/x2robot_data/zhengwei/10158/20260311-day-desk_distribute_fruits_jl",
+    #     "/x2robot_data/zhengwei/10158/20260311-night-desk_distribute_fruits_jl",
+    #     "/x2robot_data/zhengwei/10159/20260311-night-desk_distribute_fruits_jl",
+    #     "/x2robot_data/zhengwei/10159/20260311-day-desk_distribute_fruits_jl",
+    #     "/x2robot_data/zhengwei/10165/20260311-night-desk_distribute_fruits_jl",
+    #     "/x2robot_data/zhengwei/10353/20260311-night-desk_distribute_fruits_jl",
+    # ]
 
+    # src_path_list = [
+    #     "/x2robot_data/zhengwei/10153/20260312-day-desk_put_ring_onto_rod_jl",
+    #     "/x2robot_data/zhengwei/10155/20260312-night-desk_put_ring_onto_rod_jl",
+    #     "/x2robot_data/zhengwei/10154/20260312-day-desk_put_ring_onto_rod_jl",
+    #     "/x2robot_data/zhengwei/10152/20260310-day-desk_put_ring_onto_rod_jl",
+    #     "/x2robot_data/zhengwei/10152/20260309-night-desk_put_ring_onto_rod_jl",
+    #     "/x2robot_data/zhengwei/10152/20260309-day-desk_put_ring_onto_rod_jl",
+    #     "/x2robot_data/zhengwei/10158/20260310-day-desk_put_ring_onto_rod_jl",
+    #     "/x2robot_data/zhengwei/10158/20260309-night-desk_put_ring_onto_rod_jl-1",
+    #     "/x2robot_data/zhengwei/10159/20260310-day-desk_put_ring_onto_rod_jl",
+    #     "/x2robot_data/zhengwei/10165/20260309-night-desk_put_ring_onto_rod_jl",
+    #     "/x2robot_data/zhengwei/10353/20260310-day-desk_put_ring_onto_rod_jl",
+    # ]
+
+    # src_path_list = [
+    # "/x2robot_data/zhengwei/10153/20260313-day-desk_insert_wireline_jl",
+    # "/x2robot_data/zhengwei/10155/20260312-night-desk_insert_wireline_jl",
+    # "/x2robot_data/zhengwei/10154/20260313-day-desk_insert_wireline_jl",
+    # "/x2robot_data/zhengwei/10152/20260309-day-desk_insert_wireline_jl",
+    # "/x2robot_data/zhengwei/10152/20260310-day-desk_insert_wireline_jl",
+    # "/x2robot_data/zhengwei/10158/20260309-day-desk_insert_wireline_jl",
+    # "/x2robot_data/zhengwei/10159/20260310-day-desk_insert_wireline_jl",
+    # "/x2robot_data/zhengwei/10165/20260309-night-desk_insert_wireline_jl",
+    # "/x2robot_data/zhengwei/10353/20260311-day-desk_insert_wireline_jl",
+    # "/x2robot_data/zhengwei/10353/20260310-day-desk_insert_wireline_jl"
+    # ]
+
+    src_path_list = [
+    "/x2robot_data/zhengwei/10152/20260205-day-4_5_letters_task",
+    "/x2robot_data/zhengwei/10153/20260209-day-4_5_letters_task",
+    "/x2robot_data/zhengwei/10153/20260204-day-4_5_letters_task",
+    "/x2robot_data/zhengwei/10154/20260205-day-4_5_letters_task",
+    "/x2robot_data/zhengwei/10154/20260204-day-4_5_letters_task-1",
+    "/x2robot_data/zhengwei/10154/20260205-day-4_5_letters_task",
+    "/x2robot_data/zhengwei/10155/20260205-day-4_5_letters_task",
+    "/x2robot_data/zhengwei/10155/20260204-day-4_5_letters_task",
+    "/x2robot_data/zhengwei/10159/20260210-day-4_5_letters_task",
+    "/x2robot_data/zhengwei/10158/20260211-day-4_5_letters_task",
+    "/x2robot_data/zhengwei/10158/20260210-day-4_5_letters_task",
+    "/x2robot_data/zhengwei/10165/20260210-day-4_5_letters_task",
+    "/x2robot_data/zhengwei/10353/20260212-day-4_5_letters_task",
+    "/x2robot_data/zhengwei/10153/20260204-night-2_3_letters_task",
+    "/x2robot_data/zhengwei/10155/20260202-night-2_3_letters_task",
+    "/x2robot_data/zhengwei/10154/20260203-night-2_3_letters_task",
+    "/x2robot_data/zhengwei/10152/20260202-night-2_3_letters_task",
+    "/x2robot_data/zhengwei/10152/20260203-night-2_3_letters_task",
+    "/x2robot_data/zhengwei/10158/20260210-night-2_3_letters_task",
+    "/x2robot_data/zhengwei/10159/20260210-night-2_3_letters_task",
+    "/x2robot_data/zhengwei/10165/20260211-night-2_3_letters_task",
+    "/x2robot_data/zhengwei/10353/20260211-night-2_3_letters_task",
+    "/x2robot_data/zhengwei/10153/20260130-night-single_letter_task",
+    "/x2robot_data/zhengwei/10155/20260130-night-single_letter_task",
+    "/x2robot_data/zhengwei/10154/20260130-night-single_letter_task",
+    "/x2robot_data/zhengwei/10163/20260130-night-single_letter_task",
+    "/x2robot_data/zhengwei/10152/20260130-night-single_letter_task-1",
+    "/x2robot_data/zhengwei/10158/20260210-night-single_letter_task",
+    "/x2robot_data/zhengwei/10159/20260210-night-single_letter_task",
+    "/x2robot_data/zhengwei/10165/20260210-night-single_letter_task",
+    "/x2robot_data/zhengwei/10353/20260211-night-single_letter_task",
+    ]
     
     for src_path in src_path_list:
         episode_paths = []

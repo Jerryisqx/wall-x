@@ -70,6 +70,8 @@ class PreprocessedDataset(Dataset[T_co]):
         # init configs
         self.config = config
         self.use_fast_tokenizer = self.config.get("use_fast_tokenizer", False)
+        self.use_state_string_representation = self.config.get("use_state_string_representation", False)
+        self.state_bins = self.config.get("state_bins", 512)
         self.dataload_config = dataload_config
         self.normalizer_action = (normalizer_action,)
         self.normalizer_propri = normalizer_propri
@@ -150,12 +152,10 @@ class PreprocessedDataset(Dataset[T_co]):
         # action = maybe_expand_rotation_to_6d(action, action_present_keys, dof_cfg)
         # action = pad_tensor_with_nan(action, sum(dof_cfg[k] for k in pred_keys))
 
-        use_state_string_representation = True
-        state_bins = 512
         agent_pos_mask = torch.ones_like(state)
-        if use_state_string_representation:
+        if self.use_state_string_representation:
             norm_np = state.cpu().numpy()
-            discretized = np.digitize(norm_np, bins=np.linspace(-1, 1, state_bins + 1)[:-1]) - 1
+            discretized = np.digitize(norm_np, bins=np.linspace(-1, 1, self.state_bins + 1)[:-1]) - 1
             discretized = discretized[:, 0, :]
             mask_np = agent_pos_mask[:, 0, :].cpu().numpy().astype(bool) if isinstance(agent_pos_mask, torch.Tensor) else agent_pos_mask[:, 0, :].astype(bool)
             propri_string = " ".join(map(str, discretized[0, mask_np[0]]))
@@ -177,13 +177,22 @@ class PreprocessedDataset(Dataset[T_co]):
         text = process_grounding_points(
             complete_text, h, w, resize_h, resize_w, self.data_config.model_type
         )
-        result = {
-            "image_inputs": image_inputs,
-            "text": text,
-            "action": action,
-            # "agent_pos": agent_pos,
-            "frame_index": frame_index,
-        }
+        if self.use_state_string_representation:
+            result = {
+                "image_inputs": image_inputs,
+                "text": text,
+                "action": action,
+                # "agent_pos": agent_pos,
+                "frame_index": frame_index,
+            }
+        else:
+            result = {
+                "image_inputs": image_inputs,
+                "text": text,
+                "action": action,
+                "agent_pos": agent_pos,
+                "frame_index": frame_index,
+            }
 
         return result
     
