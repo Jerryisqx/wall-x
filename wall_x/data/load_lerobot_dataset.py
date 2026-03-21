@@ -16,7 +16,7 @@ from wall_x.data.utils import (
     preprocesser_call,
 )
 from wall_x.data.data_utils import compute_delta_from_state_and_abs_rot
-
+from tqdm import tqdm
 from transformers import AutoProcessor
 from .utils import KEY_MAPPINGS
 from wall_x.data.utils import maybe_expand_rotation_to_6d, infer_present_keys, pad_tensor_with_nan
@@ -52,6 +52,11 @@ class PreprocessedDataset(Dataset[T_co]):
     ):
         self.hf_dataset = dataset
 
+
+        self._cam_key_mapping = KEY_MAPPINGS[self.hf_dataset.meta.repo_id]["camera"]
+        self._state_key_mapping = KEY_MAPPINGS[self.hf_dataset.meta.repo_id]
+        self._action_key_mapping = KEY_MAPPINGS[self.hf_dataset.meta.repo_id]
+
         if test_only:
             self._dataset = dataset
         else:
@@ -61,6 +66,9 @@ class PreprocessedDataset(Dataset[T_co]):
                 [0.95, 0.05],
                 torch.Generator().manual_seed(seed) if seed is not None else None,
             )
+            # print(f"Train size: {len(self.train_dataset)}")
+            # self.train_dataset = self.delete_static_frames(self.train_dataset)
+            # print(f"after delete Train size: {len(self.train_dataset)}")
             self._train()
 
         self.seed = seed
@@ -88,9 +96,7 @@ class PreprocessedDataset(Dataset[T_co]):
             priority_order=self.dataload_config.get("priority_order", None),
         )
 
-        self._cam_key_mapping = KEY_MAPPINGS[self.hf_dataset.meta.repo_id]["camera"]
-        self._state_key_mapping = KEY_MAPPINGS[self.hf_dataset.meta.repo_id]
-        self._action_key_mapping = KEY_MAPPINGS[self.hf_dataset.meta.repo_id]
+        
 
     def _vision_preprocess(self, frames):
         processed_frames = []
@@ -129,15 +135,51 @@ class PreprocessedDataset(Dataset[T_co]):
 
         return processed_frames, orig_height, orig_width, resized_height, resized_width
 
+    def delete_static_frames(self,data, threshold=0.01):
+        new_data = []
+        for d in data:
+            action = d[self._action_key_mapping["action"]]
+            action = np.array(action)
+            if not self.is_stationary([action], threshold=threshold):
+                new_data.append(d)
+        return new_data
+    
+    def is_stationary(self, frame_data, threshold=0.01):
+        """检查当前帧是否静止，适应不同维度的数据"""
+        stationary = True
+        for data in frame_data:
+            if data.ndim == 1:
+                diffs = np.abs(np.diff(data))
+            else:  # data.ndim == 2
+                diffs = np.linalg.norm(np.diff(data, axis=0), axis=1)
+            if np.any(diffs >= threshold):
+                stationary = False
+                break
+        return stationary
+
     def __getitem__(self, index):
-        data = self._dataset[index]
+        # data = self._dataset[index]
+        data = None
+        is_still_frame = True
+        count = 0
+        while is_still_frame:
+            data = self._dataset[index]
+            if self.is_stationary([np.array(data[self._action_key_mapping["action"]])]):
+                index = torch.randint(0, len(self._dataset), (1,)).item()
+                print("skip static frame")
+            else:
+                is_still_frame = False
+            count+=1
+            if count > 10:  # 最多判断10次都跳过
+                is_still_frame = False
+
         image_inputs, h, w, resize_h, resize_w = self._vision_preprocess(data)
         agent_pos = data[self._state_key_mapping["state"]]
         action = data[self._action_key_mapping["action"]]
-        
-        obs_keys = self.dataload_config["obs_action_keys"]
-        pred_keys = self.dataload_config["predict_action_keys"]
-        agent_pos_cfg = self.config["agent_pos_config"]
+
+        # obs_keys = self.dataload_config["obs_action_keys"]
+        # pred_keys = self.dataload_config["predict_action_keys"]
+        # agent_pos_cfg = self.config["agent_pos_config"]
         dof_cfg = self.config["dof_config"]
 
         action = torch.tensor(self.relative(action, agent_pos, dof_cfg))
@@ -521,6 +563,7 @@ class DataCollator:
         return inputs
 
 
+
 def load_lerobot_data(
     config,
     lerobot_config,
@@ -584,6 +627,8 @@ def load_lerobot_data(
         delta_timestamps=delta_timestamps,
         video_backend="pyav",
     )
+
+
 
     if rank == 0:
         print(f"Selected train episodes: {train_dataset.episodes}")
