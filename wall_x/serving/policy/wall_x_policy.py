@@ -6,11 +6,52 @@ import numpy as np
 import base64
 import copy
 import cv2
+import time
 from wall_x.serving.websocket_policy_server import BasePolicy
 from wall_x.model.qwen2_5_based.modeling_qwen2_5_vl_act import Qwen2_5_VLMoEForAction
 from wall_x.serving.policy.utils import prepare_batch
 from wall_x.model.model_utils import load_wallx_processors, register_normalizers
 from wall_x.data.utils import maybe_expand_rotation_to_6d, convert_6D_to_euler, convert_euler_to_6D
+from wall_x.data.data_utils import euler_to_matrix_zyx_6d_nb,compose_state_and_delta_to_abs_6d,so3_to_euler_zyx_batch_nb
+from wall_x.serving.policy.utils import UnifiedTrajectoryProcessor
+import time
+import os
+from matplotlib import pyplot as plt
+# 注册 msgpack-numpy 扩展
+import msgpack_numpy as m
+m.patch()
+
+
+def plot_openloop(action_pred_list, action_gt_list, save_path):
+    assert len(action_pred_list) == len(
+        action_gt_list
+    ), "Predicted action and ground truth action must have the same shape."
+
+    dim = len(action_pred_list[0])
+    plt.figure(figsize=(12, 4 * dim))
+
+    for i in range(dim):
+        plt.subplot(dim, 1, i + 1)
+
+        # plot every 10th action
+        plt.xticks(np.arange(0, sum(len(gt) for gt in action_gt_list), step=10))
+        # for j in range(len(action_gt_list)):
+        gt_action = np.array(action_gt_list)
+        predict_action = np.array(action_pred_list)
+        
+        plt.plot(gt_action[:, i], label="Ground Truth", color="blue")
+        plt.plot(predict_action[:, i], label="Model Output", color="orange")
+ 
+        plt.title(f"Action Dimension {i + 1}")
+        plt.xlabel("Time Step")
+        plt.ylabel("Action Value")
+        plt.legend()
+
+
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(f"{save_path}.jpg", dpi=200)
+    print(f"Saved plot to {save_path}.jpg")
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +284,7 @@ class WallXPolicy(BasePolicy):
         else:
             prompt = self.default_prompt or "Execute the task."
         
-        converted["prompt"] = "Place the cup of the specified color onto the plate"
+        converted["prompt"] = prompt
         
         # 4. Add dataset_names (use the dataset name from training config)
         # converted["dataset_names"] = "pick_up_cup_with_certain_color"
@@ -270,21 +311,23 @@ class WallXPolicy(BasePolicy):
                 - Additional metadata
         """
 
+        obs_copy = copy.deepcopy(obs)
+        print("obs_copy: ",obs_copy['state'])
         if "state" in obs and self._obs_action_keys:
-            obs["state"]["follow1_pos"] = np.array(obs["state"]["follow1_pos"])
-            obs["state"]["follow2_pos"] = np.array(obs["state"]["follow2_pos"])
+            obs["state"]["follow1_pos"] = np.array(obs["state"]["follow1_pos"]).reshape(1, -1)
+            obs["state"]["follow2_pos"] = np.array(obs["state"]["follow2_pos"]).reshape(1, -1)
 
-            rotation1 = convert_euler_to_6D(obs["state"]["follow1_pos"][3:6])
+            rotation1 = euler_to_matrix_zyx_6d_nb(obs["state"]["follow1_pos"][:,3:6])[0]
             if rotation1.shape[0] == 1:
                 rotation1 = rotation1[0]
             # print("rotation1 shape: ",rotation1.shape)
             # print(obs["state"]["follow1_pos"].shape)
-            obs["state"]["follow1_pos"] = np.concatenate([obs["state"]["follow1_pos"][:3],rotation1,obs["state"]["follow1_pos"][6:7]],axis=0)
+            obs["state"]["follow1_pos"] = np.concatenate([obs["state"]["follow1_pos"][0,:3],rotation1,obs["state"]["follow1_pos"][0,6:7]],axis=0)
 
-            rotation2 = convert_euler_to_6D(obs["state"]["follow2_pos"][3:6])
+            rotation2 = euler_to_matrix_zyx_6d_nb(obs["state"]["follow2_pos"][:,3:6])[0]
             if rotation2.shape[0] == 1:
                 rotation2 = rotation2[0]
-            obs["state"]["follow2_pos"] = np.concatenate([obs["state"]["follow2_pos"][:3],rotation2,obs["state"]["follow2_pos"][6:7]],axis=0)
+            obs["state"]["follow2_pos"] = np.concatenate([obs["state"]["follow2_pos"][0,:3],rotation2,obs["state"]["follow2_pos"][0,6:7]],axis=0)
         
         obs = self._convert_x2robot_obs(obs)
 
@@ -339,16 +382,63 @@ class WallXPolicy(BasePolicy):
             actions = predicted_actions[0]  # (T, action_dim)
 
             # print("state.shape:",state[None,:].shape)
-            actions = state[None,:]+actions
+            # actions = state[None,:]+actions/
             
-            result = {"action": predicted_actions}
+            # result = {"action": predicted_actions}
+            result = {}
+
+            state_pos_left = state[None,:][:,:3]
+            state_rotation_left = state[None,:][:,3:9]
+            state_gripper_left = state[None,:][:,9:10]
+            state_pos_right = state[None,:][:,10:13]
+            state_rotation_right = state[None,:][:,13:19]
+            state_gripper_right = state[None,:][:,19:20]
+
+
+            action_pos_left = state_pos_left+actions[:, :3]
+            action_rotation_left = compose_state_and_delta_to_abs_6d(actions[:, 3:9], state_rotation_left[0])
+            action_gripper_left = actions[:, 9:10]
+            action_pos_right = state_pos_right+actions[:, 10:13]
+            action_rotation_right = compose_state_and_delta_to_abs_6d(actions[:, 13:19],state_rotation_right[0])
+            action_gripper_right = actions[:, 19:20]
+
+            # action_pos_left = actions[:, :3]
+            # action_rotation_left = actions[:, 3:9]
+            # action_gripper_left = actions[:, 9:10]
+            # action_pos_right = actions[:, 10:13]
+            # action_rotation_right = actions[:, 13:19]
+            # action_gripper_right = actions[:, 19:20]
 
             # print(result)
 
-            rotation1 = convert_6D_to_euler(actions[:, 3:9])
-            result["follow1_pos"] = np.concatenate([actions[:, :3],rotation1,actions[:, 9:10]],axis=1)
-            rotation2 = convert_6D_to_euler(actions[:, 13:19])
-            result["follow2_pos"] = np.concatenate([actions[:, 10:13],rotation2,actions[:, 19:20]],axis=1)
+            rotation1 = so3_to_euler_zyx_batch_nb(action_rotation_left)
+            result["follow1_pos"] = np.concatenate([action_pos_left,rotation1,action_gripper_left],axis=1)
+            result["follow1_pos"] = np.concatenate([np.array(obs_copy["state"]["follow1_pos"]).reshape(1, -1),result["follow1_pos"]])  #[32,7]
+            result["follow1_pos"] = result["follow1_pos"]
+            rotation2 = so3_to_euler_zyx_batch_nb(action_rotation_right)
+            result["follow2_pos"] = np.concatenate([action_pos_right,rotation2,action_gripper_right],axis=1)
+            result["follow2_pos"] = np.concatenate([np.array(obs_copy["state"]["follow2_pos"]).reshape(1, -1),result["follow2_pos"]])  #[32,7]
+            result["follow2_pos"] = result["follow2_pos"]
+
+
+            robot_action_interpolate_multiplier = 2
+            target_length = robot_action_interpolate_multiplier * len(result["follow1_pos"])
+            result["follow1_pos"], result["follow2_pos"] = (
+                UnifiedTrajectoryProcessor.interpolate_trajectory_batch(
+                    [result["follow1_pos"], result["follow2_pos"]], target_length
+                )
+            )
+
+            result["follow1_pos"]=result["follow1_pos"][:64,:].tolist()
+            result["follow2_pos"]=result["follow2_pos"][:64,:].tolist()
+
+            print("result:",result)
+            b=result
+            gt_b=np.concatenate([np.array(b["follow1_pos"]),np.array(b["follow2_pos"])],axis=1)
+            tt=int(time.time())
+            sp=f"/x2robot_v2/yangping/github/jerry_git/wall-x/workspace/server/visualize/b-10-141-parcel-joint2-{tt}.png"
+            plot_openloop(gt_b,gt_b,sp)
+            # time.sleep(3)
             
             return result
 
