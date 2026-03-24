@@ -1,60 +1,80 @@
 import logging
-import re
 from typing import Dict, Any, List
 import torch
-import base64
-import cv2
 import copy
 import numpy as np
+import base64
+import copy
+import cv2
+import time
 from wall_x.serving.websocket_policy_server import BasePolicy
 from wall_x.model.qwen2_5_based.modeling_qwen2_5_vl_act import Qwen2_5_VLMoEForAction
 from wall_x.serving.policy.utils import prepare_batch
 from wall_x.model.model_utils import load_wallx_processors, register_normalizers
-from wall_x.infer.base_dataclass import RobotStateActionData
-from wall_x.infer.utils import UnifiedTrajectoryProcessor
+from wall_x.data.data_utils import euler_to_matrix_zyx_6d_nb,compose_state_and_delta_to_abs_6d,so3_to_euler_zyx_batch_nb
+from wall_x.serving.policy.utils import UnifiedTrajectoryProcessor
+import time
+import os
+from matplotlib import pyplot as plt
+# 注册 msgpack-numpy 扩展
+import msgpack_numpy as m
+m.patch()
+
+
+def plot_openloop(action_pred_list, action_gt_list, save_path):
+    assert len(action_pred_list) == len(
+        action_gt_list
+    ), "Predicted action and ground truth action must have the same shape."
+
+    dim = len(action_pred_list[0])
+    plt.figure(figsize=(12, 4 * dim))
+
+    for i in range(dim):
+        plt.subplot(dim, 1, i + 1)
+
+        # plot every 10th action
+        plt.xticks(np.arange(0, sum(len(gt) for gt in action_gt_list), step=10))
+        # for j in range(len(action_gt_list)):
+        gt_action = np.array(action_gt_list)
+        predict_action = np.array(action_pred_list)
+        
+        plt.plot(gt_action[:, i], label="Ground Truth", color="blue")
+        plt.plot(predict_action[:, i], label="Model Output", color="orange")
+ 
+        plt.title(f"Action Dimension {i + 1}")
+        plt.xlabel("Time Step")
+        plt.ylabel("Action Value")
+        plt.legend()
+
+
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(f"{save_path}.jpg", dpi=200)
+    print(f"Saved plot to {save_path}.jpg")
 
 logger = logging.getLogger(__name__)
 
-ROBOT_ACTION_KEY_MAPPING = {
-    "follow_left_ee_cartesian_pos": "follow1_pos[:3]",
-    "follow_left_ee_rotation": "follow1_pos[3:6]",
-    "follow_left_gripper": "follow1_pos[6:7]",
-    "follow_right_ee_cartesian_pos": "follow2_pos[:3]",
-    "follow_right_ee_rotation": "follow2_pos[3:6]",
-    "follow_right_gripper": "follow2_pos[6:7]",
-    "head_actions": "head_pos",
-    "head_rotation": "head_pos",
-    "height": "lift",
-    "velocity_decomposed": "velocity_decomposed",
-}
-
 
 def _decode_base64_image(base64_str: str) -> np.ndarray:
-    """Decode base64 JPEG string to numpy RGB array. Returns None on failure."""
+    """Decode base64 string to numpy image array (RGB format)."""
     if base64_str is None:
-        return None
+        return np.zeros((480, 640, 3), dtype=np.uint8)
     try:
         img_bytes = base64.b64decode(base64_str)
         nparr = np.frombuffer(img_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if img is None:
-            return None
-        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            return np.zeros((480, 640, 3), dtype=np.uint8)
+        # Convert BGR to RGB
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return img
     except Exception as e:
         logger.warning(f"Failed to decode base64 image: {e}")
-        return None
-
+        return np.zeros((480, 640, 3), dtype=np.uint8)
+    
 
 class WallXPolicy(BasePolicy):
-    """Policy wrapper for Wall-X model.
-
-    Accepts x2robot_client input format:
-        state: dict with follow1_pos, follow2_pos, head_pos, lift, ...
-        views: dict with camera base64 or numpy images
-        instruction / prompt: task description
-    Returns x2robot_client output format:
-        follow1_pos / follow2_pos: np.float32 (T+1, 7), row 0 = current state
-    """
+    """Policy wrapper for Wall-X model that implements the BasePolicy interface."""
 
     def __init__(
         self,
@@ -75,8 +95,23 @@ class WallXPolicy(BasePolicy):
         image_factor: int = 28,
         max_length: int = 2048,
     ):
+        """Initialize the Wall-X policy.
+
+        Args:
+            model_path: Path to the pretrained model checkpoint
+            action_tokenizer_path: Path to the action tokenizer
+            action_dim: Dimension of action space
+            pred_horizon: Prediction horizon for actions
+            device: Device to run model on ('cuda' or 'cpu')
+            dtype: Data type for model ('bfloat16', 'float16', or 'float32')
+            predict_mode: Prediction mode ('fast' or 'slow')
+            default_prompt: Default text prompt for the model
+            min_pixels: Minimum pixels for image resizing
+            max_pixels: Maximum pixels for image resizing
+            image_factor: Factor for smart resize
+            max_length: Maximum sequence length for text
+        """
         logger.info(f"Loading Wall-X model from {model_path}")
-        self.config = train_config
 
         self.normalizer_action, self.normalizer_propri = register_normalizers(
             train_config, model_path
@@ -94,237 +129,253 @@ class WallXPolicy(BasePolicy):
         self.model = self.model.to(device)
         self.model.to_bfloat16_for_selected_params()
 
-        self.fixed_action_dim = action_dim
+        # hard code the action dim to 20 for align to wall-x configuration
+        self.fixed_action_dim = 26
+
         self.action_dim = action_dim
         self.agent_pos_dim = action_dim
         self.pred_horizon = pred_horizon
         self.device = device
         self.predict_mode = predict_mode
         self.default_prompt = default_prompt
-        self.dataset_name = dataset_name
         self.camera_key = camera_key
 
+        # Image preprocessing config
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
         self.image_factor = image_factor
         self.max_length = max_length
 
-        self.use_state_string_representation = train_config.get("data", {}).get(
-            "use_state_string_representation",
-            train_config.get("use_state_string_representation", False),
-        )
+        # self.use_state_string_representation = train_config.get("data", {}).get(
+        #     "use_state_string_representation", train_config.get("use_state_string_representation", False)
+        # )
+        self.use_state_string_representation = True
         self.state_bins = train_config.get("data", {}).get("state_bins", 512)
         self._obs_action_keys = train_config.get("data", {}).get("obs_action_keys", [])
-        self._predict_action_keys = train_config.get("data", {}).get("predict_action_keys", [])
         self._agent_pos_config = train_config.get("agent_pos_config", {})
-        self._dof_config = train_config.get("dof_config", {})
+        self.dataset_name = train_config.get("dataset_name", "ex_normal")
+        self.interpolate_multiplier = 2
 
+
+        print("predict_mode", predict_mode)
+        print("camera_key", camera_key)
+        print("use_state_string_representation", self.use_state_string_representation)
+        print("state_bins", self.state_bins)
+
+        # Load processor
         logger.info("Loading processor and tokenizer...")
+
         processors_dict = load_wallx_processors(train_config)
         self.processor = processors_dict["processor"]
 
+        # Action buffer for multi-step predictions
         self.action_buffer = []
         self.buffer_index = 0
-        self.action_start_ratio = 0.0
-        self.action_end_ratio = 1.0
-        self.action_interpolate_multiplier = 2
 
         logger.info(
-            f"Model loaded. Device: {device}, Action dim: {action_dim}, "
-            f"Horizon: {pred_horizon}, Dataset: {dataset_name}"
+            f"Model loaded successfully. Device: {device}, Action dim: {action_dim}, Horizon: {pred_horizon}"
         )
-        logger.info(f"predict_mode={predict_mode}, camera_key={camera_key}")
-        logger.info(f"obs_action_keys={self._obs_action_keys}")
-        logger.info(f"predict_action_keys={self._predict_action_keys}")
+        if "x2_normal" in self.normalizer_propri.min:
+            print(f"normalizer_propri x2_normal min: {self.normalizer_propri.min['x2_normal'].data}")
+            print(f"normalizer_propri x2_normal delta: {self.normalizer_propri.delta['x2_normal'].data}")
+            print(f"normalizer_propri x2_normal dim: {self.normalizer_propri.min['x2_normal'].shape}")
+
+        if "x2_normal" in self.normalizer_action.min:
+            print(f"normalizer_action x2_normal min: {self.normalizer_action.min['x2_normal'].data}")
+            print(f"normalizer_action x2_normal delta: {self.normalizer_action.delta['x2_normal'].data}")
+            print(f"normalizer_action x2_normal dim: {self.normalizer_action.min['x2_normal'].shape}")
 
     @property
     def metadata(self) -> Dict[str, Any]:
+        """Return metadata about the policy."""
         return {
             "action_dim": self.action_dim,
             "pred_horizon": self.pred_horizon,
             "device": self.device,
             "predict_mode": self.predict_mode,
-            "dataset_name": self.dataset_name,
         }
 
     def reset(self) -> None:
+        """Reset the policy state."""
         self.action_buffer = []
         self.buffer_index = 0
+        logger.debug("Policy reset")
 
-    def _build_robot_state(self, state_dict) -> RobotStateActionData:
-        """Build RobotStateActionData from a client state dict.
-
-        Parses keys like follow1_pos, follow2_pos using ROBOT_ACTION_KEY_MAPPING.
+    def _convert_x2robot_obs(self, obs: Dict) -> Dict:
+        """Convert x2robot client format to Wall-X format.
+        
+        x2robot format:
+        {
+            "state": {"follow1_pos": [...], "follow2_pos": [...], ...},
+            "views": {"camera_front": base64, "camera_left": base64, "camera_right": base64},
+            "instruction": ["task description"]
+        }
+        
+        Wall-X format:
+        {
+            "face_view": np.ndarray,
+            "left_wrist_view": np.ndarray,
+            "right_wrist_view": np.ndarray,
+            "prompt": str,
+            "state": flat_array,
+            "dataset_names": ["x2"]
+        }
         """
-        rsad = RobotStateActionData()
-        for key, state_key_str in ROBOT_ACTION_KEY_MAPPING.items():
-            value = None
-            match = re.match(r"(\w+)\[(.*)\]", state_key_str)
-            if match:
-                base_key = match.group(1)
-                if base_key in state_dict:
-                    slicing_str = match.group(2)
-                    slice_parts = slicing_str.split(":")
-                    slice_args = [(int(p) if p.strip() else None) for p in slice_parts]
-                    s = slice(*slice_args)
-                    value = np.asarray(state_dict[base_key])[s]
-            else:
-                if state_key_str in state_dict:
-                    value = state_dict[state_key_str]
-            if value is not None:
-                rsad.save_state_data_with_key(np.asarray(value)[None], key)
-        return rsad
-
-    def _postprocess_with_rsad(self, predicted_actions, rsad):
-        """Convert model output to x2robot_client format via RSAD auto-conversion.
-
-        Returns:
-        - follow1_pos: np.float32 (T+1, 7) with row 0 = current state
-        - follow2_pos: np.float32 (T+1, 7) with row 0 = current state
-        - predict_action: raw model output
-        """
-        rsad.save_action_data(predicted_actions, self._predict_action_keys)
-
-        result = {"predict_action": predicted_actions}
-
-        for side in ("left", "right"):
-            pos = rsad.data.get(f"action_{side}_ee_cartesian_pos")
-            rot = rsad.data.get(f"action_{side}_ee_rotation")
-            grip = rsad.data.get(f"action_{side}_gripper")
-            parts = [p for p in (pos, rot, grip) if p is not None]
-            if not parts:
-                continue
-
-            arm_key = "follow1_pos" if side == "left" else "follow2_pos"
-            arm_action = np.concatenate(parts, axis=1)
-
-            state_pos = rsad.data.get(f"state_{side}_ee_cartesian_pos")
-            state_rot = rsad.data.get(f"state_{side}_ee_rotation")
-            state_grip = rsad.data.get(f"state_{side}_gripper")
-            state_parts = [p for p in (state_pos, state_rot, state_grip) if p is not None]
-            if state_parts:
-                state_row = np.concatenate(state_parts, axis=1)
-                arm_action = np.concatenate([state_row, arm_action], axis=0)
-
-            result[arm_key] = arm_action.astype(np.float32)
-
-        # print(result)
-        return result
-
-    def _serialize_actions(
-        self,
-        result: Dict,
-        interpolate_multiplier: int = None,
-        start_ratio: float = None,
-        end_ratio: float = None,
-    ) -> Dict:
-        """Trim and interpolate action trajectories.
-
-        Each follow*_pos has shape (T+1, 7) where row 0 is current state.
-        1. Skip row 0 (state), trim action rows by [start_ratio, end_ratio]
-        2. Interpolate to target_length if multiplier > 1
-        3. Prepend state row back (for client interpolation starting point)
-        """
-        if interpolate_multiplier is None:
-            interpolate_multiplier = self.action_interpolate_multiplier
-        if start_ratio is None:
-            start_ratio = self.action_start_ratio
-        if end_ratio is None:
-            end_ratio = self.action_end_ratio
-
-        arm_keys = [k for k in ("follow1_pos", "follow2_pos") if k in result]
-        if not arm_keys:
-            return result
-
-        trimmed = {}
-        state_rows = {}
-        for key in arm_keys:
-            traj = np.asarray(result[key])
-            state_rows[key] = traj[:1]
-            actions = traj[1:]
-            actual_len = len(actions)
-            s = int(start_ratio * actual_len)
-            e = int(end_ratio * actual_len)
-            trimmed[key] = actions[s:e]
-
-        if interpolate_multiplier >= 1 and len(trimmed[arm_keys[0]]) > 0:
-            target_length = interpolate_multiplier * len(trimmed[arm_keys[0]])
-            interpolated = UnifiedTrajectoryProcessor.interpolate_trajectory_batch(
-                [trimmed[k] for k in arm_keys], target_length
-            )
-            for i, key in enumerate(arm_keys):
-                trimmed[key] = interpolated[i]
-
-        for key in arm_keys:
-            result[key] = np.concatenate(
-                [state_rows[key], trimmed[key]], axis=0
-            ).astype(np.float32)
-
-        return result
-
-    def _normalize_client_input(self, obs: Dict) -> None:
-        """Normalize x2robot_client input in-place for the model pipeline.
-
-        - views (base64/numpy) → flatten to obs top-level
-        - instruction → prompt
-        - dataset_names from self.dataset_name
-        """
-        if "views" in obs:
-            for cam_key, img_data in obs["views"].items():
-                if isinstance(img_data, str):
-                    obs[cam_key] = _decode_base64_image(img_data)
-                elif isinstance(img_data, np.ndarray):
-                    obs[cam_key] = img_data
-            del obs["views"]
-
-        if "instruction" not in obs:
-            instr = obs.pop("prompt", None) or self.default_prompt
-            if instr is not None:
-                obs["instruction"] = str(instr)
+        # Check if this is x2robot format (has "views" key)
+        if "views" not in obs:
+            # Already in Wall-X format or unknown format
+            return obs
+        
+        logger.debug("Converting x2robot observation format to Wall-X format")
+        
+        converted = {}
+        
+        # 1. Convert images from base64 to numpy arrays
+        views = obs.get("views", {})
+        camera_mapping = {
+            "camera_front": "face_view",
+            "camera_left": "left_wrist_view", 
+            "camera_right": "right_wrist_view",
+        }
+        
+        for src_key, dst_key in camera_mapping.items():
+            img_data = views.get(src_key)
+            if isinstance(img_data, str):
+                # base64 encoded
+                img = _decode_base64_image(img_data)
+            elif isinstance(img_data, np.ndarray):
+                img = img_data
+            # else:
+            #     img = np.zeros((256, 256, 3), dtype=np.uint8)
+            
+            # Resize image to match training resolution
+            target_height = 256
+            # img = _resize_image_by_height(img, target_height)
+            converted[dst_key] = img
+        
+        # 2. Convert state from nested dict to flat array
+        state_dict = obs.get("state", {})
+        
+        # Extract state components in order (matching training data format)
+        # Order: follow1_pos(7) + follow2_pos(7) = 14 dims for dual-arm
+        follow1_pos = state_dict.get("follow1_pos", np.zeros(1, dtype=np.float32))
+        follow2_pos = state_dict.get("follow2_pos", np.zeros(1, dtype=np.float32))
+        
+        # Flatten to 1D arrays if needed
+        if hasattr(follow1_pos, 'flatten'):
+            follow1_pos = follow1_pos.flatten()
+        if hasattr(follow2_pos, 'flatten'):
+            follow2_pos = follow2_pos.flatten()
+        
+        # Concatenate state
+        state_flat = np.concatenate([
+            np.array(follow1_pos, dtype=np.float32),
+            np.array(follow2_pos, dtype=np.float32),
+            np.array([0]*6, dtype=np.float32),
+        ])
+        
+        converted["state"] = state_flat
+        
+        # 3. Convert instruction to prompt
+        instruction = obs.get("instruction", [""])
+        if isinstance(instruction, np.ndarray):
+            instruction = instruction.tolist()
+        if isinstance(instruction, list) and len(instruction) > 0:
+            prompt = str(instruction[0])
+        elif isinstance(instruction, str):
+            prompt = instruction
         else:
-            instr = obs["instruction"]
-            if isinstance(instr, np.ndarray):
-                instr = instr.flat[0]
-            if isinstance(instr, (list, tuple)):
-                instr = instr[0] if instr else ""
-            obs["instruction"] = str(instr)
+            prompt = self.default_prompt or "Execute the task."
+        
+        converted["prompt"] = prompt
+        
+        # 4. Add dataset_names (use the dataset name from training config)
+        # converted["dataset_names"] = "pick_up_cup_with_certain_color"
+        converted["dataset_names"] ="ex_normal"
+        
+        logger.debug(f"Converted obs keys: {list(converted.keys())}, state shape: {converted['state'].shape}")
+        
+        return converted
 
-        if "dataset_names" not in obs:
-            obs["dataset_names"] = self.dataset_name
+    def _x2robot_euler_state_to_6d(self, obs: Dict) -> None:
+      """If obs has x2robot state keys, convert euler segments to 6D rotation in-place."""
+      if "state" not in obs or not self._obs_action_keys:
+          return
+      st = obs["state"]
+      for key in ("follow1_pos", "follow2_pos"):
+          arr = np.asarray(st[key], dtype=np.float32).reshape(1, -1)
+          rot_6d = euler_to_matrix_zyx_6d_nb(arr[:, 3:6])[0]
+          if rot_6d.shape[0] == 1:
+              rot_6d = rot_6d[0]
+          st[key] = np.concatenate([arr[0, :3], rot_6d, arr[0, 6:7]], axis=0)
+
+    def _x2robot_build_follow_trajectories(
+      self,
+      obs_copy: Dict,
+      state_flat: np.ndarray,
+      actions: np.ndarray,
+    ) -> Dict[str, List]:
+        """Map delta actions to absolute trajectories, interpolate, trim to robot command length.
+        Raw length is 1 (current) + pred_horizon. After interpolation, keep at most
+        ``interpolate_multiplier * pred_horizon`` steps (e.g. 2 * 32 = 64).
+        """
+        s = state_flat[None, :]
+        state_pos_left = s[:, :3]
+        state_rot_left = s[:, 3:9]
+        state_pos_right = s[:, 10:13]
+        state_rot_right = s[:, 13:19]
+        action_pos_left = state_pos_left + actions[:, :3]
+        action_rot_left = compose_state_and_delta_to_abs_6d(actions[:, 3:9], state_rot_left[0])
+        action_grip_left = actions[:, 9:10]
+        action_pos_right = state_pos_right + actions[:, 10:13]
+        action_rot_right = compose_state_and_delta_to_abs_6d(actions[:, 13:19], state_rot_right[0])
+        action_grip_right = actions[:, 19:20]
+        euler_left = so3_to_euler_zyx_batch_nb(action_rot_left)
+        euler_right = so3_to_euler_zyx_batch_nb(action_rot_right)
+        follow1 = np.concatenate([action_pos_left, euler_left, action_grip_left], axis=1)
+        follow2 = np.concatenate([action_pos_right, euler_right, action_grip_right], axis=1)
+        init1 = np.asarray(obs_copy["state"]["follow1_pos"], dtype=np.float32).reshape(1, -1)
+        init2 = np.asarray(obs_copy["state"]["follow2_pos"], dtype=np.float32).reshape(1, -1)
+        raw_follow1 = np.concatenate([init1, follow1], axis=0)
+        raw_follow2 = np.concatenate([init2, follow2], axis=0)
+        target_len = self.interpolate_multiplier * len(raw_follow1)
+        interp1, interp2 = UnifiedTrajectoryProcessor.interpolate_trajectory_batch(
+            [raw_follow1, raw_follow2], target_len
+        )
+        max_output_steps = self.interpolate_multiplier * self.pred_horizon
+        n = min(max_output_steps, interp1.shape[0])
+        return {
+            "follow1_pos": interp1[:n, :].tolist(),
+            "follow2_pos": interp2[:n, :].tolist(),
+        }
 
     def infer(self, obs: Dict) -> Dict:
-        """Infer action from x2robot_client observation.
+        """Infer action from observation.
 
-        Input (x2robot_client format):
-            state: dict with follow1_pos(7D), follow2_pos(7D), head_pos, lift, ...
-            views: dict with camera base64/numpy images
-            instruction / prompt: task text
+        Args:
+            obs: Dictionary containing:
+                - 'image': Image observation (numpy array or PIL Image)
+                - 'prompt': Optional text prompt
+                - 'state': Optional robot state
+                - Other modality-specific observations
 
-        Output (x2robot_client format):
-            follow1_pos: np.float32 (T+1, 7), row 0 = current state, 3D euler
-            follow2_pos: np.float32 (T+1, 7), row 0 = current state, 3D euler
-            predict_action: raw model output
+        Returns:
+            Dictionary containing:
+                - 'action': Predicted action (numpy array)
+                - Additional metadata
         """
-        # print(obs.keys())
-        # print(obs["state"].keys())
-        # print(obs["views"].keys())
-        # print(obs["prompt"])
-        self._normalize_client_input(obs)
 
-        state_dict = obs.get("state", {})
-        if not isinstance(state_dict, dict):
-            raise ValueError(
-                "Expected obs['state'] to be a dict (x2robot_client format), "
-                f"got {type(state_dict).__name__}"
-            )
+        obs_copy = copy.deepcopy(obs)
+        self._x2robot_euler_state_to_6d(obs)
+        obs = self._convert_x2robot_obs(obs)
 
-        rsad = self._build_robot_state(state_dict)
-        agent_pos = rsad.get_agent_pos(self._obs_action_keys)
-        if agent_pos.ndim == 3:
-            agent_pos = agent_pos.squeeze(0)
-        obs["state"] = agent_pos
+        state = obs.get("state")
+        print(obs.keys())
+        if state is None:
+          raise ValueError("obs must contain 'state' after conversion")
 
         try:
+            # Need to predict new actions
             input_batch = prepare_batch(
                 obs,
                 self.processor,
@@ -361,23 +412,29 @@ class WallXPolicy(BasePolicy):
                 predicted_actions = np.zeros(
                     [1, self.pred_horizon, self.action_dim]
                 ).astype(np.float32)
-            else:
-                predicted_actions = (
-                    outputs["predict_action"][:, :, : self.action_dim]
-                    .detach()
-                    .cpu()
-                    .to(torch.float32)
-                    .numpy()
-                )
 
-            model_output = self._postprocess_with_rsad(predicted_actions, rsad)
-
-            return self._serialize_actions(
-                model_output,
-                interpolate_multiplier=obs.get("robot_action_interpolate_multiplier"),
-                start_ratio=obs.get("robot_action_start_ratio"),
-                end_ratio=obs.get("robot_action_end_ratio"),
+            predicted_actions = (
+                outputs["predict_action"][:, :, : self.action_dim]
+                .detach()
+                .cpu()
+                .to(torch.float32)
+                .numpy()
             )
+            actions = predicted_actions[0]  # (T, action_dim)
+
+            result = self._x2robot_build_follow_trajectories(
+                obs_copy, np.asarray(state, dtype=np.float32), actions
+            )
+            # print("result:",result)
+            # b=result
+            # gt_b=np.concatenate([np.array(b["follow1_pos"]),np.array(b["follow2_pos"])],axis=1)
+            # tt=int(time.time())
+            # sp=f"/x2robot_v2/jerry1/open-wallx/logs/visualize/b-10-141-desk-put-ring-onto-rod-joint2-{tt}.png"
+            # plot_openloop(gt_b,gt_b,sp)
+            # time.sleep(3)
+            
+            return result
+
         except Exception as e:
             logger.error(f"Error during inference: {e}")
             raise

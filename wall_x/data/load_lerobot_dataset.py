@@ -15,11 +15,11 @@ from wall_x.data.utils import (
     replace_action_token,
     preprocesser_call,
 )
-
+from wall_x.data.data_utils import compute_delta_from_state_and_abs_rot
+from tqdm import tqdm
 from transformers import AutoProcessor
 from .utils import KEY_MAPPINGS
 from wall_x.data.utils import maybe_expand_rotation_to_6d, infer_present_keys, pad_tensor_with_nan
-import wall_x.infer.data_utils as infer_data_utils
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -48,8 +48,14 @@ class PreprocessedDataset(Dataset[T_co]):
         rank=0,
         world_size=1,
         test_only=False,
+        use_relative_action=False,
     ):
         self.hf_dataset = dataset
+
+
+        self._cam_key_mapping = KEY_MAPPINGS[self.hf_dataset.meta.repo_id]["camera"]
+        self._state_key_mapping = KEY_MAPPINGS[self.hf_dataset.meta.repo_id]
+        self._action_key_mapping = KEY_MAPPINGS[self.hf_dataset.meta.repo_id]
 
         if test_only:
             self._dataset = dataset
@@ -60,6 +66,9 @@ class PreprocessedDataset(Dataset[T_co]):
                 [0.95, 0.05],
                 torch.Generator().manual_seed(seed) if seed is not None else None,
             )
+            # print(f"Train size: {len(self.train_dataset)}")
+            # self.train_dataset = self.delete_static_frames(self.train_dataset)
+            # print(f"after delete Train size: {len(self.train_dataset)}")
             self._train()
 
         self.seed = seed
@@ -69,11 +78,14 @@ class PreprocessedDataset(Dataset[T_co]):
         # init configs
         self.config = config
         self.use_fast_tokenizer = self.config.get("use_fast_tokenizer", False)
+        self.use_state_string_representation = self.config.get("use_state_string_representation", False)
+        self.state_bins = self.config.get("state_bins", 512)
         self.dataload_config = dataload_config
         self.normalizer_action = (normalizer_action,)
         self.normalizer_propri = normalizer_propri
         # self.norm_stats = norm_stats
         self.lerobot_config = lerobot_config
+        self.use_relative_action = use_relative_action
 
         self.data_config = X2RDataProcessingConfig().update(
             train_test_split=self.dataload_config["train_test_split"],
@@ -84,9 +96,7 @@ class PreprocessedDataset(Dataset[T_co]):
             priority_order=self.dataload_config.get("priority_order", None),
         )
 
-        self._cam_key_mapping = KEY_MAPPINGS[self.hf_dataset.meta.repo_id]["camera"]
-        self._state_key_mapping = KEY_MAPPINGS[self.hf_dataset.meta.repo_id]
-        self._action_key_mapping = KEY_MAPPINGS[self.hf_dataset.meta.repo_id]
+        
 
     def _vision_preprocess(self, frames):
         processed_frames = []
@@ -125,45 +135,68 @@ class PreprocessedDataset(Dataset[T_co]):
 
         return processed_frames, orig_height, orig_width, resized_height, resized_width
 
+    def delete_static_frames(self,data, threshold=0.01):
+        new_data = []
+        for d in data:
+            action = d[self._action_key_mapping["action"]]
+            action = np.array(action)
+            if not self.is_stationary([action], threshold=threshold):
+                new_data.append(d)
+        return new_data
+    
+    def is_stationary(self, frame_data, threshold=0.01):
+        """检查当前帧是否静止，适应不同维度的数据"""
+        stationary = True
+        for data in frame_data:
+            if data.ndim == 1:
+                diffs = np.abs(np.diff(data))
+            else:  # data.ndim == 2
+                diffs = np.linalg.norm(np.diff(data, axis=0), axis=1)
+            if np.any(diffs >= threshold):
+                stationary = False
+                break
+        return stationary
+
     def __getitem__(self, index):
-        data = self._dataset[index]
+        # data = self._dataset[index]
+        data = None
+        is_still_frame = True
+        count = 0
+        while is_still_frame:
+            data = self._dataset[index]
+            if self.is_stationary([np.array(data[self._action_key_mapping["action"]])]):
+                index = torch.randint(0, len(self._dataset), (1,)).item()
+                print("skip static frame")
+            else:
+                is_still_frame = False
+            count+=1
+            if count > 10:  # 最多判断10次都跳过
+                is_still_frame = False
+
         image_inputs, h, w, resize_h, resize_w = self._vision_preprocess(data)
-        agent_pos = data[self._state_key_mapping["state"]]
-        action = data[self._action_key_mapping["action"]]
-        
-        obs_keys = self.dataload_config["obs_action_keys"]
-        pred_keys = self.dataload_config["predict_action_keys"]
-        agent_pos_cfg = self.config["agent_pos_config"]
+        agent_pos = np.array(data[self._state_key_mapping["state"]])
+        action = np.array(data[self._action_key_mapping["action"]])
+
         dof_cfg = self.config["dof_config"]
+        fixed_action_size = sum(v for v in dof_cfg.values())
 
-        state_present_keys = infer_present_keys(agent_pos.shape[-1], obs_keys, agent_pos_cfg)
-        agent_pos = maybe_expand_rotation_to_6d(agent_pos, state_present_keys, agent_pos_cfg)
-        agent_pos = pad_tensor_with_nan(agent_pos, sum(agent_pos_cfg[k] for k in obs_keys))
+        if action.shape[-1] < fixed_action_size:
+            pad_w = fixed_action_size - action.shape[-1]
+            action = np.pad(action, [(0, 0), (0, pad_w)], constant_values=np.nan)
+        if agent_pos.shape[-1] < fixed_action_size:
+            pad_w = fixed_action_size - agent_pos.shape[-1]
+            agent_pos = np.pad(agent_pos, (0, pad_w), constant_values=np.nan)
 
-        action_present_keys = infer_present_keys(action.shape[-1], pred_keys, dof_cfg)
-        action = maybe_expand_rotation_to_6d(action, action_present_keys, dof_cfg)
-        action = pad_tensor_with_nan(action, sum(dof_cfg[k] for k in pred_keys))
+        action = torch.tensor(self.relative(action, agent_pos, dof_cfg))
+        state = torch.tensor(agent_pos).clone().detach()[None, None, :]
 
-        if any("relative" in k for k in pred_keys):
-            action_np = action.numpy().astype(np.float64)
-            state_np = agent_pos.numpy().astype(np.float64)
-            was_1d = action_np.ndim == 1
-            if was_1d:
-                action_np = action_np[np.newaxis, :]
-            idx = 0
-            for pred_k, dof_k in zip(pred_keys, dof_cfg):
-                dim = dof_cfg[dof_k]
-                if "relative" in pred_k:
-                    seg = action_np[:, idx:idx + dim]
-                    st = state_np[idx:idx + dim] if state_np.ndim == 1 else state_np[:1, idx:idx + dim].squeeze(0)
-                    if "rotation" in dof_k and not np.isnan(seg).any() and not np.isnan(st).any():
-                        action_np[:, idx:idx + dim] = infer_data_utils.compute_delta_from_state_and_abs_rot(seg, st)
-                    elif not np.isnan(seg).any() and not np.isnan(st).any():
-                        action_np[:, idx:idx + dim] = seg - st
-                idx += dim
-            if was_1d:
-                action_np = action_np.squeeze(0)
-            action = torch.from_numpy(action_np).to(action.dtype)
+        agent_pos_mask = (~torch.isnan(state)).float()
+        if self.use_state_string_representation:
+            norm_np = state.nan_to_num(nan=0.0).cpu().numpy()
+            discretized = np.digitize(norm_np, bins=np.linspace(-1, 1, self.state_bins + 1)[:-1]) - 1
+            discretized = discretized[:, 0, :]
+            mask_np = agent_pos_mask[:, 0, :].cpu().numpy().astype(bool)
+            propri_string = " ".join(map(str, discretized[0, mask_np[0]]))
 
         frame_index = data["frame_index"]
         instruction_info = {"instruction": data["task"]}
@@ -176,19 +209,58 @@ class PreprocessedDataset(Dataset[T_co]):
             self.data_config.priority_order,
             self._cam_key_mapping,
             generate_subtask_ratio=generate_subtask_ratio,
+            propri_string=propri_string
         )
         text = process_grounding_points(
             complete_text, h, w, resize_h, resize_w, self.data_config.model_type
         )
-        result = {
-            "image_inputs": image_inputs,
-            "text": text,
-            "action": action,
-            "agent_pos": agent_pos,
-            "frame_index": frame_index,
-        }
+        if self.use_state_string_representation:
+            result = {
+                "image_inputs": image_inputs,
+                "text": text,
+                "action": action,
+                # "agent_pos": agent_pos,
+                "frame_index": frame_index,
+            }
+        else:
+            result = {
+                "image_inputs": image_inputs,
+                "text": text,
+                "action": action,
+                "agent_pos": agent_pos,
+                "frame_index": frame_index,
+            }
 
         return result
+    
+    def relative(self, action, agent_pos, dof_config):
+        action = np.array(action)
+        agent_pos = np.array(agent_pos)
+
+        cur = 0
+        new_action = []
+        for key, dim in dof_config.items():
+            if key in ["velocity_decomposed", "height", "head_actions"]:
+                continue
+            action_clip = action[:, cur:cur + dim]
+            agent_pos_clip = agent_pos[cur:cur + dim]
+
+            if np.isnan(agent_pos_clip).any():
+                new_action.append(action_clip)
+            elif "relative" not in key:
+                new_action.append(action_clip)
+            elif "rotation" in key:
+                tmp = compute_delta_from_state_and_abs_rot(
+                    action_clip, agent_pos_clip
+                )
+                new_action.append(tmp)
+            else:
+                new_action.append(action_clip - agent_pos_clip[None, :])
+            cur += dim
+
+        new_action = np.concatenate(new_action, axis=1)
+        return new_action
+
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -364,7 +436,7 @@ class DataCollator:
 
     def __call__(self, batch):
         additional_inputs = {}
-
+        fixed_action_size = 26
         for key in batch[0].keys():
             if key == "agent_pos":
                 agent_pos = torch.stack([item["agent_pos"] for item in batch])
@@ -374,29 +446,29 @@ class DataCollator:
                 # print("agent_pos_mask",agent_pos_mask.shape)
                 agent_pos.nan_to_num_(nan=0.0)
 
-                # if agent_pos.shape[-1] != 20:
-                #     agent_pos = torch.cat(
-                #         [
-                #             agent_pos,
-                #             torch.zeros(
-                #                 agent_pos.shape[0],
-                #                 agent_pos.shape[1],
-                #                 20 - agent_pos.shape[-1],
-                #             ),
-                #         ],
-                #         dim=-1,
-                #     )
-                #     agent_pos_mask = torch.cat(
-                #         [
-                #             agent_pos_mask,
-                #             torch.zeros(
-                #                 agent_pos_mask.shape[0],
-                #                 agent_pos_mask.shape[1],
-                #                 20 - agent_pos_mask.shape[-1],
-                #             ),
-                #         ],
-                #         dim=-1,
-                #     )
+                if agent_pos.shape[-1] != fixed_action_size:
+                    agent_pos = torch.cat(
+                        [
+                            agent_pos,
+                            torch.zeros(
+                                agent_pos.shape[0],
+                                agent_pos.shape[1],
+                                fixed_action_size - agent_pos.shape[-1],
+                            ),
+                        ],
+                        dim=-1,
+                    )
+                    agent_pos_mask = torch.cat(
+                        [
+                            agent_pos_mask,
+                            torch.zeros(
+                                agent_pos_mask.shape[0],
+                                agent_pos_mask.shape[1],
+                                fixed_action_size - agent_pos_mask.shape[-1],
+                            ),
+                        ],
+                        dim=-1,
+                    )
                 agent_pos = self.normalizer_propri.normalize_data(
                     agent_pos, self.dataset_name
                 )
@@ -409,27 +481,27 @@ class DataCollator:
                 dof_mask = (~torch.isnan(action)).float()
                 action.nan_to_num_(nan=0.0)
 
-                # if action.shape[-1] != 20:
-                #     action = torch.cat(
-                #         [
-                #             action,
-                #             torch.zeros(
-                #                 action.shape[0], action.shape[1], 20 - action.shape[-1]
-                #             ),
-                #         ],
-                #         dim=-1,
-                #     )
-                #     dof_mask = torch.cat(
-                #         [
-                #             dof_mask,
-                #             torch.zeros(
-                #                 dof_mask.shape[0],
-                #                 dof_mask.shape[1],
-                #                 20 - dof_mask.shape[-1],
-                #             ),
-                #         ],
-                #         dim=-1,
-                #     )
+                if action.shape[-1] != fixed_action_size:
+                    action = torch.cat(
+                        [
+                            action,
+                            torch.zeros(
+                                action.shape[0], action.shape[1], fixed_action_size - action.shape[-1]
+                            ),
+                        ],
+                        dim=-1,
+                    )
+                    dof_mask = torch.cat(
+                        [
+                            dof_mask,
+                            torch.zeros(
+                                dof_mask.shape[0],
+                                dof_mask.shape[1],
+                                fixed_action_size - dof_mask.shape[-1],
+                            ),
+                        ],
+                        dim=-1,
+                    )
                 action = self.normalizer_action.normalize_data(
                     action, self.dataset_name
                 )
@@ -481,6 +553,7 @@ class DataCollator:
         ].shape[0]
 
         return inputs
+
 
 
 def load_lerobot_data(
@@ -546,6 +619,8 @@ def load_lerobot_data(
         delta_timestamps=delta_timestamps,
         video_backend="pyav",
     )
+
+
 
     if rank == 0:
         print(f"Selected train episodes: {train_dataset.episodes}")
