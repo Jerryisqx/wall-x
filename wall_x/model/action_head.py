@@ -104,10 +104,10 @@ class Normalizer(nn.Module):
             }
         )
 
-        for k, v in action_statistic.items():
-            print_rank_last(
-                f"Normalizer: {k} min {action_statistic[k][min_key]} delta {action_statistic[k][delta_key]}"
-            )
+        # for k, v in action_statistic.items():
+        #     print_rank_last(
+        #         f"Normalizer: {k} min {action_statistic[k][min_key]} delta {action_statistic[k][delta_key]}"
+        #     )
 
     def normalize_data(self, xs, dataset_names):
         new_xs = []
@@ -792,8 +792,37 @@ class ActionProcessor(nn.Module):
             action_pred = self.action_proj_back(
                 action_hidden_states[:, : self.action_hidden_size]
             )
-            v_pred = action_pred
-            loss = self.mse_loss(v_pred, flow)
+
+            if getattr(self.config, "use_x_pred", False):
+                noisy_action_flat = self.noisy_action.reshape(
+                    -1, self.noisy_action.shape[-1]
+                )
+                time_expanded_flat = self.time_expanded.expand(
+                    -1, self.noisy_action.shape[1], -1
+                ).reshape(-1, 1)
+                v_pred = (action_pred - noisy_action_flat) / torch.clamp(
+                    1 - time_expanded_flat, min=0.05
+                )
+                x_pred = action_pred
+            else:
+                v_pred = action_pred
+                time_expanded_flat = self.time_expanded.expand(
+                    -1, self.noisy_action.shape[1], -1
+                ).reshape(-1, 1)
+                x_pred = (1 - time_expanded_flat) * v_pred + self.noisy_action.reshape(
+                    -1, self.noisy_action.shape[-1]
+                )
+
+            if getattr(self.config, "use_x_loss", False):
+                loss = self.mse_loss(
+                    x_pred,
+                    action_chunk.reshape(-1, action_chunk.shape[-1]).to(
+                        dtype=x_pred.dtype
+                    ),
+                )
+            else:
+                loss = self.mse_loss(v_pred, flow)
+
             if dof_mask is not None:
                 dof_mask = dof_mask.reshape(-1, dof_mask.shape[-1])
                 loss = loss * dof_mask
